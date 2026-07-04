@@ -1,0 +1,30 @@
+# --- Secrets & runtime state (never commit) ---
+# real secrets; .env.example IS tracked
+.env
+# Chrome profile + session cookies (~1.7G, sensitive)
+.auth/
+# seen-predictions state, etc.
+.data/
+logs/
+*.log
+
+# --- Python ---
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# --- Tooling caches ---
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Local agent/editor dirs ---
+.claude/
+.codex/
+.agents/
+.idea/
+.vscode/
+.DS_Store
