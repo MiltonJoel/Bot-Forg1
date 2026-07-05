@@ -31,7 +31,10 @@ async def main() -> None:
     setup_logger(settings.log_dir, settings.log_level)
     notifier = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
     await notifier.connect()  # fail fast: no Telegram, no bot
-    strategy = AggressiveFractionalKellyStrategy()
+    strategy = AggressiveFractionalKellyStrategy(
+        min_pct=settings.strategy_min_pct,
+        max_pct=settings.strategy_max_pct,
+    )
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

@@ -20,13 +20,14 @@ class Settings(BaseSettings):
     poll_interval_idle_seconds: int = 45
     poll_interval_active_seconds: int = 5
     page_refresh_after_idle_seconds: int = 1200
-    prediction_stabilization_seconds: int = 30
+    prediction_stabilization_seconds: int = 50
     balance_refresh_interval_seconds: int = 120
 
-    # Strategy
-    high_probability_threshold: float = 90.0
-    bet_high_percentage: float = 35.0
-    bet_low_percentage: float = 20.0
+    # Strategy sizing — % of balance staked per bet. min_pct is the floor (weak
+    # favorite), max_pct the ceiling (strong favorite); the site's own per-bet
+    # max_bet still caps the final amount. Set via STRATEGY_MIN_PCT / STRATEGY_MAX_PCT.
+    strategy_min_pct: float = 13.0
+    strategy_max_pct: float = 32.0
 
     # Telegram (chat_id may be empty: it's auto-discovered on startup via getUpdates)
     telegram_bot_token: str

@@ -86,6 +86,30 @@ def _extract_prediction_objects(html: str) -> list[dict[str, Any]]:
     return results
 
 
+# Every field read_active_prediction dereferences to build a Prediction. Objects
+# in the RSC payload that carry an "outcomes" array but aren't full predictions
+# (fragments emitted while a prediction is live) lack some of these, so guarding
+# on them turns a crash (KeyError: 'id') into a clean skip.
+_PREDICTION_KEYS = ("id", "title", "outcomes", "min_bet", "max_bet", "locks_at")
+_OUTCOME_KEYS = ("id", "label", "total_points", "total_bettors")
+
+
+def _is_valid_prediction(raw: dict[str, Any]) -> bool:
+    """True only for complete prediction objects. `_extract_prediction_objects`
+    returns anything with an 'outcomes' array — including partial fragments the
+    site embeds during a live prediction — so filter to objects that actually
+    have every field we read, or the build below crashes on the first missing
+    key and the whole read loop wedges (seen live: `Failed to read ... ('id')`)."""
+    if not all(k in raw for k in _PREDICTION_KEYS):
+        return False
+    outcomes = raw.get("outcomes")
+    if not isinstance(outcomes, list) or not outcomes:
+        return False
+    return all(
+        isinstance(o, dict) and all(k in o for k in _OUTCOME_KEYS) for o in outcomes
+    )
+
+
 def _is_bettable(raw: dict[str, Any], now: datetime) -> bool:
     """A prediction accepts bets only while it's open. It's NOT bettable once it
     resolves, and also not once it locks (its cutoff passes): a locked-but-not-
@@ -129,7 +153,7 @@ class PredictionPageReader:
         await self._ensure_live_page()
         response = await self._page.request.get(self._page.url)
         html = await response.text()
-        predictions = _extract_prediction_objects(html)
+        predictions = [p for p in _extract_prediction_objects(html) if _is_valid_prediction(p)]
         now = datetime.now(timezone.utc)
         open_predictions = [p for p in predictions if _is_bettable(p, now)]
         if not open_predictions:

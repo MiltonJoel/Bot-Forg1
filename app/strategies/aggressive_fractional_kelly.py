@@ -20,7 +20,7 @@ class AggressiveFractionalKellyStrategy(BettingStrategy):
         self,
         low_share_threshold: float = 45.0,
         high_share_threshold: float = 90.0,
-        min_pct: float = 4.0,
+        min_pct: float = 13.0,
         max_pct: float = 32.0,
         curve_power: float = 0.7,
     ) -> None:

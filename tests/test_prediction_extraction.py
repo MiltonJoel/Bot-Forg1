@@ -1,7 +1,11 @@
 import json
 from datetime import datetime, timezone
 
-from app.bot.prediction_page import _extract_prediction_objects, _is_bettable
+from app.bot.prediction_page import (
+    _extract_prediction_objects,
+    _is_bettable,
+    _is_valid_prediction,
+)
 
 # Shape captured live from forg1.com/predicciones on 2026-07-02: a
 # self.__next_f.push([1, "<JS-string-escaped JSON>"]) script tag embedding
@@ -75,3 +79,13 @@ def test_bettable_only_while_open_and_unlocked() -> None:
     assert _is_bettable({"status": "open", "locks_at": "2026-07-04T20:15:00.000+00:00"}, now)
     # missing/garbage timestamp falls back to the status check
     assert _is_bettable({"status": "open"}, now)
+
+
+def test_valid_prediction_rejects_fragments() -> None:
+    # a full prediction passes
+    assert _is_valid_prediction(_OPEN)
+    # a fragment with outcomes but no id/title/etc. (the KeyError: 'id' case) is skipped
+    assert not _is_valid_prediction({"outcomes": [{"id": "x"}]})
+    # an outcome missing a field is also rejected (would KeyError in the build)
+    incomplete_outcome = {**_OPEN, "outcomes": [{"id": "o", "label": "A"}]}
+    assert not _is_valid_prediction(incomplete_outcome)
