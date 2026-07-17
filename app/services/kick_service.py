@@ -43,6 +43,11 @@ class KickLiveChecker:
         self._was_live: bool | None = None
         self._live_page: Page | None = None
 
+    @property
+    def is_live(self) -> bool:
+        """True only when the stream is confirmed live (None = unknown yet)."""
+        return self._was_live is True
+
     async def run(self) -> None:
         logger.info("Kick live-check started (every {}s).", self._interval)
         while True:

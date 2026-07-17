@@ -7,14 +7,18 @@ from app.services.monitoring_service import MonitoringService
 
 
 class FakeReader:
-    def __init__(self, succeeds: bool = True) -> None:
+    def __init__(self, succeeds: bool = True, logged_in: bool = True) -> None:
         self.succeeds = succeeds
+        self.logged_in = logged_in
         self.bets: list[tuple[str, int]] = []
         self.balance_refreshes = 0
 
     async def place_bet(self, side: str, amount: int) -> bool:
         self.bets.append((side, amount))
         return self.succeeds
+
+    async def is_logged_in(self) -> bool:
+        return self.logged_in
 
     async def refresh_balance(self) -> None:
         self.balance_refreshes += 1
@@ -97,3 +101,34 @@ def test_balance_refresh_runs_when_due(tmp_path: Any) -> None:
     monitor._last_balance_refresh = 0
     asyncio.run(monitor._maybe_refresh_balance())
     assert reader.balance_refreshes == 1
+
+
+def test_balance_refresh_skipped_while_stream_offline(tmp_path: Any) -> None:
+    reader, notifier = FakeReader(), FakeNotifier()
+    monitor = _monitor(tmp_path, reader, notifier, bet=False)
+    live = False
+    monitor._stream_is_live = lambda: live
+    monitor._last_balance_refresh = 0
+    asyncio.run(monitor._maybe_refresh_balance())
+    assert reader.balance_refreshes == 0  # offline -> no clicks at all
+    live = True
+    asyncio.run(monitor._maybe_refresh_balance())
+    assert reader.balance_refreshes == 1  # live again -> resumes
+
+
+def test_logout_alerts_once_and_recovery_notifies(tmp_path: Any) -> None:
+    reader, notifier = FakeReader(logged_in=False), FakeNotifier()
+    monitor = _monitor(tmp_path, reader, notifier, bet=False)
+
+    monitor._last_balance_refresh = 0
+    asyncio.run(monitor._maybe_refresh_balance())  # logged out -> alert, no refresh
+    monitor._last_balance_refresh = 0
+    asyncio.run(monitor._maybe_refresh_balance())  # still out -> silent
+    assert reader.balance_refreshes == 0
+    assert len(notifier.messages) == 1 and "⚠️" in notifier.messages[0]
+
+    reader.logged_in = True
+    monitor._last_balance_refresh = 0
+    asyncio.run(monitor._maybe_refresh_balance())  # back -> recovery msg + refresh
+    assert reader.balance_refreshes == 1
+    assert "✅" in notifier.messages[1]

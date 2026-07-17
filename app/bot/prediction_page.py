@@ -9,6 +9,7 @@ from loguru import logger
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 
+from app.bot.login import looks_logged_out
 from app.models.prediction import Outcome, Prediction
 from app.utils.retry import flaky_page_action
 
@@ -205,21 +206,40 @@ class PredictionPageReader:
                 return None
         return None
 
+    async def is_logged_in(self) -> bool:
+        """Server-authoritative login check (same one the startup login uses).
+        A logged-out session has no header balance/refresh button, so callers
+        use this to tell 'you got logged out' apart from a flaky locator."""
+        return not await looks_logged_out(self._page, self._url)
+
     async def read_balance(self) -> int:
         """Reads "Tu balance" from the header — the account's own points,
         not the prediction pool total."""
         span = self._page.locator(_BALANCE_VALUE_SELECTOR).filter(has_text=_BALANCE_PATTERN).first
-        text = await span.inner_text()
+        # Short timeout: the span is missing entirely when the session is logged
+        # out, and the default 30s (x5 flaky retries) wedged the poll loop for
+        # minutes per cycle.
+        text = await span.inner_text(timeout=5000)
         return int(re.sub(r"[^\d]", "", text))
 
     async def refresh_balance(self) -> None:
         """Clicks the balance refresh button in the header.
 
-        This is intentionally separate from page reloads because the balance
-        button updates the points without disturbing the prediction state.
+        The button only exists on the logged-in predicciones view. Over a long
+        VPS run the single visible tab can drift off it (stale render, Cloudflare
+        re-check, session degrade) while HTTP reads keep working — so if the
+        button isn't there, reload once to re-render the header before giving up.
+        A failure that survives the reload means the visible page is genuinely
+        logged out / challenged, which betting also needs to work.
         """
+        await self._ensure_live_page()
         button = self._page.locator(_BALANCE_REFRESH_SELECTOR).first
-        await button.wait_for(state="visible", timeout=5000)
+        try:
+            await button.wait_for(state="visible", timeout=5000)
+        except PlaywrightError:
+            logger.warning("Balance button missing; reloading page to recover the header.")
+            await self._page.reload(wait_until="domcontentloaded")
+            await button.wait_for(state="visible", timeout=15_000)
         await button.click(timeout=5000)
         logger.info("Clicked balance refresh button.")
 

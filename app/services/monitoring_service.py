@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from loguru import logger
@@ -26,6 +27,7 @@ class MonitoringService:
         refresh_after_idle_seconds: int,
         stabilization_seconds: int,
         balance_refresh_interval_seconds: int,
+        stream_is_live: Callable[[], bool] | None = None,
     ) -> None:
         self._reader = reader
         self._strategy = strategy
@@ -36,11 +38,13 @@ class MonitoringService:
         self._refresh_after_idle = refresh_after_idle_seconds
         self._stabilization_seconds = stabilization_seconds
         self._balance_refresh_interval_seconds = balance_refresh_interval_seconds
+        self._stream_is_live = stream_is_live
         self._last_seen_id = self._load_last_seen()
         # ponytail: one in-memory pending slot (predictions run one at a time on
         # forg1). Lost on restart -> a result mid-flight won't be reported; fine.
         self._pending: tuple[Prediction, BetDecision] | None = None
         self._last_balance_refresh = time.monotonic()
+        self._logout_alerted = False
 
     def _load_last_seen(self) -> str | None:
         if self._seen_path.exists():
@@ -71,7 +75,13 @@ class MonitoringService:
             if prediction is None:
                 idle_elapsed += self._poll_idle
                 if idle_elapsed >= self._refresh_after_idle:
-                    await self._reader.refresh()
+                    # A reload can time out (page won't render — e.g. Cloudflare
+                    # blocking the tab). That must not crash the whole monitor
+                    # loop; log it and keep polling (reads run over HTTP anyway).
+                    try:
+                        await self._reader.refresh()
+                    except Exception as exc:
+                        logger.warning("Idle page refresh failed ({}); continuing.", exc)
                     idle_elapsed = 0
                 await asyncio.sleep(self._poll_idle)
                 continue
@@ -154,11 +164,30 @@ class MonitoringService:
                 "Skipping bet for {} because the strategy did not return a placeable amount.",
                 prediction.id,
             )
-        await self._notify(prediction, decision, placed)
+        remaining: int | None = None
+        if placed:
+            # Report the REAL balance after the bet instead of computing
+            # available_points - amount: the header snapshot the computation used
+            # can be stale, which produced wrong "quedan X pts" numbers on
+            # Telegram. Click the header refresh first so the read reflects what
+            # the site actually deducted.
+            try:
+                await self._reader.refresh_balance()
+                await asyncio.sleep(1)  # let the header update after the click
+                remaining = await self._reader.read_balance()
+            except Exception as exc:
+                logger.warning("Could not read post-bet balance ({}); omitting it.", exc)
+        await self._notify(prediction, decision, placed, remaining)
         # remember it so we can report the result once it resolves
         self._pending = (prediction, decision)
 
-    async def _notify(self, prediction: Prediction, decision: BetDecision, placed: bool) -> None:
+    async def _notify(
+        self,
+        prediction: Prediction,
+        decision: BetDecision,
+        placed: bool,
+        remaining: int | None = None,
+    ) -> None:
         if not decision.should_bet:
             result = "⏭️ Sin apuesta"
         elif placed:
@@ -169,10 +198,9 @@ class MonitoringService:
                 f"a {decision.side} — apostá manualmente"
             )
         # available_points is the pre-bet balance (still counts the stake). When a
-        # bet is placed, also show what's left after it, so the number isn't
-        # confusing next to a "bet executed" line.
-        if placed:
-            remaining = prediction.available_points - decision.amount
+        # bet is placed, also show the balance actually read from the page after
+        # the bet — never a computed guess, which was wrong when the header was stale.
+        if placed and remaining is not None:
             balance_line = (
                 f"Tu balance: {prediction.available_points} pts "
                 f"(quedan {remaining} pts tras apostar {decision.amount})"
@@ -194,17 +222,46 @@ class MonitoringService:
         if self._balance_refresh_interval_seconds <= 0:
             return
 
+        # Only click while the Kick stream is live: predictions only happen
+        # during the stream, so clicking around the clock is pure risk (steady
+        # automated traffic for Cloudflare/Vercel to flag) with zero benefit.
+        # Resumes automatically when the stream goes live again.
+        if self._stream_is_live is not None and not self._stream_is_live():
+            return
+
         now = time.monotonic()
         if now - self._last_balance_refresh < self._balance_refresh_interval_seconds:
             return
+        # Advance even on failure: a broken page gets probed once per interval,
+        # not on every poll cycle (that was the every-45s error spam).
+        self._last_balance_refresh = now
+
+        try:
+            logged_in = await self._reader.is_logged_in()
+        except Exception as exc:
+            logger.error("Could not check forg1 login state: {}", exc)
+            return
+
+        if not logged_in:
+            if not self._logout_alerted:
+                self._logout_alerted = True
+                logger.warning("forg1 session is logged out; waiting for a manual re-login.")
+                await self._notifier.send(
+                    "⚠️ La sesión de forg1 expiró — el bot no puede leer el balance ni "
+                    "apostar. Logueate de nuevo en la ventana de Chrome del bot (VNC en "
+                    "el VPS); se recupera solo al detectarlo."
+                )
+            return
+
+        if self._logout_alerted:
+            self._logout_alerted = False
+            logger.info("forg1 session is back after re-login.")
+            await self._notifier.send("✅ Sesión de forg1 recuperada — el bot sigue normal.")
 
         try:
             await self._reader.refresh_balance()
         except Exception as exc:
             logger.error("Failed to refresh balance via header button: {}", exc)
-            return
-
-        self._last_balance_refresh = now
 
     async def _notify_result(
         self, prediction: Prediction, decision: BetDecision, winning_label: str

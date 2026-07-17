@@ -5,6 +5,8 @@ from pathlib import Path
 from loguru import logger
 from playwright.async_api import BrowserContext, Page
 
+from app.services.notifier import TelegramNotifier
+
 # forg1's logged-OUT page renders the Kick connect CTA ("Conectar con Kick");
 # the logged-IN page shows the user's balance/profile instead. Verified against
 # the live site. We also trust the server-embedded "isLoggedIn" flag when present
@@ -12,7 +14,7 @@ from playwright.async_api import BrowserContext, Page
 _LOGGED_OUT_MARKER = "conectar con kick"
 
 
-async def _looks_logged_out(page: Page, url: str) -> bool:
+async def looks_logged_out(page: Page, url: str) -> bool:
     """Server-authoritative login check: reads forg1's own SSR response rather
     than the post-hydration DOM (which can momentarily show either state)."""
     resp = await page.request.get(url)
@@ -41,24 +43,43 @@ async def _restore_session(context: BrowserContext, storage_state_path: Path) ->
         logger.info("Restored {} saved cookies from {}.", len(cookies), storage_state_path)
 
 
-async def ensure_logged_in(context: BrowserContext, url: str, storage_state_path: Path) -> Page:
-    """Restores the saved session; if forg1 still shows logged out, blocks for one
-    manual Kick login, then snapshots the session so future runs restore it."""
+async def ensure_logged_in(
+    context: BrowserContext,
+    url: str,
+    storage_state_path: Path,
+    notifier: TelegramNotifier | None = None,
+) -> Page:
+    """Restores the saved session; if forg1 still shows logged out, alerts on
+    Telegram and polls until a manual Kick login happens in the open browser
+    window, then snapshots the session so future runs restore it.
+
+    Polling (instead of waiting for Enter on stdin) is what makes this work
+    under systemd on the VPS: there is no stdin there, and input() crash-looped
+    the whole service (browser opened, died at the prompt, systemd restarted it).
+    """
     await _restore_session(context, storage_state_path)
+    # Open forg1 in a fresh page. (Reusing context.pages[0] looked tidier but that
+    # index isn't reliably the visible tab with a real profile — it left the
+    # visible window on about:blank while forg1 loaded into an off-screen page.)
     page = await context.new_page()
     await page.goto(url, wait_until="domcontentloaded")
 
-    if await _looks_logged_out(page, url):
-        logger.warning("forg1 shows logged out. Complete the Kick login in the browser window.")
-        print(
-            "\n>>> Log into forg1.com (click 'Conectar con Kick' and finish the Kick "
-            "login) in the opened browser window, then press Enter here <<<\n"
+    if await looks_logged_out(page, url):
+        logger.warning(
+            "forg1 shows logged out. Complete the Kick login in the browser window; "
+            "the bot resumes on its own (checks every 30s)."
         )
-        await asyncio.to_thread(input)
-        await page.reload(wait_until="domcontentloaded")
-        if await _looks_logged_out(page, url):
-            raise RuntimeError("Still logged out after confirmation — aborting.")
+        if notifier is not None:
+            await notifier.send(
+                "⚠️ Sesión de forg1 expirada — entrá a la ventana de Chrome del bot "
+                "(VNC en el VPS) y logueate con Kick. El bot sigue solo al detectarlo."
+            )
+        while await looks_logged_out(page, url):
+            await asyncio.sleep(30)
+        await page.goto(url, wait_until="domcontentloaded")  # show the logged-in page
         logger.info("Login confirmed.")
+        if notifier is not None:
+            await notifier.send("✅ Sesión de forg1 recuperada — el bot sigue normal.")
     else:
         logger.info("Already logged into forg1.")
 

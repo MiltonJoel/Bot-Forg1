@@ -42,8 +42,22 @@ async def main() -> None:
         loop.add_signal_handler(sig, stop.set)
 
     async with persistent_context(settings.chrome_profile_dir, settings.headless) as context:
-        page = await ensure_logged_in(context, settings.forg1_url, settings.storage_state_path)
+        page = await ensure_logged_in(
+            context, settings.forg1_url, settings.storage_state_path, notifier
+        )
         reader = PredictionPageReader(page, settings.forg1_url)
+        # The context is passed ON PURPOSE (owner's decision): when the stream
+        # goes live the checker opens kick.com in a tab, and closes it when the
+        # stream ends. Known trade-offs, accepted: the tab plays the video
+        # (bandwidth) and Kick may rotate the session cookies forg1 authenticates
+        # through, logging forg1 out — if that happens the monitor detects it,
+        # alerts on Telegram, and recovers after a manual re-login (VNC on the VPS).
+        kick_checker = KickLiveChecker(
+            settings.kick_channel,
+            settings.kick_check_interval_seconds,
+            notifier,
+            context,
+        )
         monitor = MonitoringService(
             reader,
             strategy,
@@ -54,16 +68,9 @@ async def main() -> None:
             settings.page_refresh_after_idle_seconds,
             settings.prediction_stabilization_seconds,
             settings.balance_refresh_interval_seconds,
-        )
-        # Alert-only (context omitted): the checker pings Kick's public API and
-        # notifies on live/offline. It must NOT open kick.com in this shared
-        # context — doing so rotates/clears the Kick session cookies that forg1
-        # authenticates through, which logs you out of forg1.
-        kick_checker = KickLiveChecker(
-            settings.kick_channel,
-            settings.kick_check_interval_seconds,
-            notifier,
-            context,
+            # balance-refresh clicks only happen while the stream is live —
+            # no automated clicking around the clock for Cloudflare to flag.
+            stream_is_live=lambda: kick_checker.is_live,
         )
 
         tasks = [
@@ -73,6 +80,10 @@ async def main() -> None:
 
         await stop.wait()
         logger.info("Shutdown signal received (Ctrl+C or SIGTERM) — stopping gracefully.")
+        try:
+            await notifier.send("🛑 Bot forg1 detenido")
+        except Exception as exc:  # a failed notify must not block shutdown
+            logger.error("Could not send shutdown notification: {}", exc)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
