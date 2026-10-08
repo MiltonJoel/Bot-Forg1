@@ -1,0 +1,278 @@
+diff --git a/app/strategies/aggressive_fractional_kelly.py b/app/strategies/aggressive_fractional_kelly.py
+deleted file mode 100644
+index 8222bdb..0000000
+--- a/app/strategies/aggressive_fractional_kelly.py
++++ /dev/null
+@@ -1,94 +0,0 @@
+-from math import log10
+-
+-from app.models.prediction import BetDecision, Prediction
+-from app.strategies.base_strategy import BettingStrategy
+-
+-
+-class AggressiveFractionalKellyStrategy(BettingStrategy):
+-    """RETIRED — kept only for backtest comparison. Do not re-enable.
+-
+-    Measured on 19 head-to-head markets from this bot's own logs: -23% ROI,
+-    and -85% of bankroll when replayed with compounding. It is not unlucky, it
+-    is backwards: in a pari-mutuel pool an outcome holding share `s` pays
+-    `1/s - 1`, so this staked MORE as the payout got SMALLER — up to a full-size
+-    bet into a 100%-share market that pays 0.000x and can only lose.
+-
+-    Superseded by ContrarianPariMutuelStrategy, which prices every outcome
+-    against what it actually pays.
+-
+-    ---
+-
+-    Aggressive always-bet sizing for a pari-mutuel pool.
+-
+-    The site does not expose a true win probability or payout edge, so this
+-    strategy uses the leading outcome's share of the pool as a momentum proxy.
+-    It then converts that signal into a bankroll fraction using a steep curve:
+-
+-    - weak consensus still gets a minimum exposure,
+-    - strong consensus ramps quickly toward the maximum percentage,
+-    - bets are always placed when the balance can satisfy the minimum bet.
+-    """
+-
+-    def __init__(
+-        self,
+-        low_share_threshold: float = 45.0,
+-        high_share_threshold: float = 90.0,
+-        min_pct: float = 13.0,
+-        max_pct: float = 32.0,
+-        curve_power: float = 0.7,
+-    ) -> None:
+-        if high_share_threshold <= low_share_threshold:
+-            raise ValueError("high_share_threshold must be greater than low_share_threshold")
+-        if min_pct <= 0 or max_pct <= 0:
+-            raise ValueError("min_pct and max_pct must be positive")
+-        if max_pct < min_pct:
+-            raise ValueError("max_pct must be greater than or equal to min_pct")
+-        if curve_power <= 0:
+-            raise ValueError("curve_power must be positive")
+-
+-        self._low_share_threshold = low_share_threshold
+-        self._high_share_threshold = high_share_threshold
+-        self._min_pct = min_pct
+-        self._max_pct = max_pct
+-        self._curve_power = curve_power
+-
+-    def decide(self, prediction: Prediction) -> BetDecision:
+-        if prediction.available_points < prediction.min_bet:
+-            return BetDecision(
+-                should_bet=False,
+-                side=prediction.leading_outcome.label,
+-                amount=0,
+-                reason=(
+-                    f"available_points={prediction.available_points} < "
+-                    f"min_bet={prediction.min_bet}"
+-                ),
+-            )
+-
+-        share = prediction.leading_share
+-        normalized = (share - self._low_share_threshold) / (
+-            self._high_share_threshold - self._low_share_threshold
+-        )
+-        normalized = max(0.0, min(1.0, normalized))
+-
+-        # Make the curve aggressive: it ramps faster than linear as confidence
+-        # increases, but still keeps a floor so every valid prediction gets action.
+-        momentum = normalized**self._curve_power
+-
+-        # Larger pools are less noisy, so nudge the size upward as the pool grows.
+-        pool_factor = max(0.85, min(1.10, log10(prediction.total_pool + 10) / 5))
+-
+-        pct = (self._min_pct + (self._max_pct - self._min_pct) * momentum) * pool_factor
+-        amount = int(prediction.available_points * pct / 100)
+-        amount = max(prediction.min_bet, amount)
+-        amount = min(prediction.max_bet, amount)
+-
+-        return BetDecision(
+-            should_bet=True,
+-            side=prediction.leading_outcome.label,
+-            amount=amount,
+-            reason=(
+-                f"leading_share={share:.1f}% normalized={normalized:.2f} "
+-                f"momentum={momentum:.2f} pool_factor={pool_factor:.2f} "
+-                f"-> stake={pct:.1f}%"
+-            ),
+-        )
+diff --git a/app/strategies/fixed_percentage.py b/app/strategies/fixed_percentage.py
+deleted file mode 100644
+index b7d2d6c..0000000
+--- a/app/strategies/fixed_percentage.py
++++ /dev/null
+@@ -1,29 +0,0 @@
+-from app.models.prediction import BetDecision, Prediction
+-from app.strategies.base_strategy import BettingStrategy
+-
+-
+-class FixedPercentageStrategy(BettingStrategy):
+-    """Forg1 has no probability field (pari-mutuel pool, not fixed odds) — this
+-    uses the leading outcome's pool share as the proxy: >threshold% -> high_pct
+-    of the account's points, else low_pct. Respects the prediction's own
+-    min_bet/max_bet so the suggestion is always placeable."""
+-
+-    def __init__(self, threshold: float, high_pct: float, low_pct: float) -> None:
+-        self._threshold = threshold
+-        self._high_pct = high_pct
+-        self._low_pct = low_pct
+-
+-    def decide(self, prediction: Prediction) -> BetDecision:
+-        share = prediction.leading_share
+-        pct = self._high_pct if share > self._threshold else self._low_pct
+-        amount = min(int(prediction.available_points * pct / 100), prediction.max_bet)
+-        should_bet = amount >= prediction.min_bet
+-        return BetDecision(
+-            should_bet=should_bet,
+-            side=prediction.leading_outcome.label,
+-            amount=amount if should_bet else 0,
+-            reason=(
+-                f"leading_share={share:.1f}% of pool -> {pct}% of "
+-                f"{prediction.available_points} pts (min_bet={prediction.min_bet})"
+-            ),
+-        )
+diff --git a/scripts/demo_kick_tab.py b/scripts/demo_kick_tab.py
+deleted file mode 100644
+index 51acf93..0000000
+--- a/scripts/demo_kick_tab.py
++++ /dev/null
+@@ -1,25 +0,0 @@
+-"""Headed demo of the live-stream tab feature, no forg1 login needed.
+-Opens a real Chrome on the configured Kick channel when it's live.
+-Ctrl-C or `pkill -f demo_kick_tab` to stop."""
+-
+-import asyncio
+-
+-from playwright.async_api import async_playwright
+-
+-from app.config.settings import Settings
+-from app.services.kick_service import KickLiveChecker
+-from app.services.notifier import TelegramNotifier
+-
+-
+-async def main() -> None:
+-    s = Settings()  # type: ignore[call-arg]
+-    notifier = TelegramNotifier(s.telegram_bot_token, s.telegram_chat_id)
+-    async with async_playwright() as pw:
+-        browser = await pw.chromium.launch(headless=False)
+-        context = await browser.new_context()
+-        checker = KickLiveChecker(s.kick_channel, s.kick_check_interval_seconds, notifier, context)
+-        await checker.run()  # loops forever; opens the tab on the live edge
+-
+-
+-if __name__ == "__main__":
+-    asyncio.run(main())
+diff --git a/tests/test_aggressive_fractional_kelly.py b/tests/test_aggressive_fractional_kelly.py
+deleted file mode 100644
+index 83bb5ee..0000000
+--- a/tests/test_aggressive_fractional_kelly.py
++++ /dev/null
+@@ -1,46 +0,0 @@
+-from datetime import datetime, timezone
+-
+-from app.models.prediction import Outcome, Prediction
+-from app.strategies.aggressive_fractional_kelly import AggressiveFractionalKellyStrategy
+-
+-
+-def _prediction(leader_points: int, other_points: int, balance: int = 10_000) -> Prediction:
+-    return Prediction(
+-        id="x",
+-        title="Quien gana el mapa?",
+-        outcomes=[
+-            Outcome(id="a", label="TeamA", total_points=leader_points, total_bettors=10),
+-            Outcome(id="b", label="TeamB", total_points=other_points, total_bettors=5),
+-        ],
+-        min_bet=500,
+-        max_bet=5000,
+-        locks_at=datetime.now(timezone.utc),
+-        available_points=balance,
+-        captured_at=datetime.now(timezone.utc),
+-    )
+-
+-
+-def test_strong_signal_bets_more_aggressively() -> None:
+-    strategy = AggressiveFractionalKellyStrategy()
+-    weak = strategy.decide(_prediction(leader_points=55, other_points=45))
+-    strong = strategy.decide(_prediction(leader_points=950, other_points=50))
+-
+-    assert weak.should_bet is True
+-    assert strong.should_bet is True
+-    assert strong.amount > weak.amount
+-
+-
+-def test_always_bets_when_minimum_is_available() -> None:
+-    strategy = AggressiveFractionalKellyStrategy()
+-    decision = strategy.decide(_prediction(leader_points=50, other_points=50, balance=600))
+-
+-    assert decision.should_bet is True
+-    assert decision.amount >= 500
+-
+-
+-def test_below_minimum_balance_skips_bet() -> None:
+-    strategy = AggressiveFractionalKellyStrategy()
+-    decision = strategy.decide(_prediction(leader_points=90, other_points=10, balance=100))
+-
+-    assert decision.should_bet is False
+-    assert decision.amount == 0
+diff --git a/tests/test_fixed_percentage_strategy.py b/tests/test_fixed_percentage_strategy.py
+deleted file mode 100644
+index e46344d..0000000
+--- a/tests/test_fixed_percentage_strategy.py
++++ /dev/null
+@@ -1,54 +0,0 @@
+-from datetime import datetime, timezone
+-
+-from app.models.prediction import Outcome, Prediction
+-from app.strategies.fixed_percentage import FixedPercentageStrategy
+-
+-
+-def _prediction(leader_points: int, other_points: int, balance: int = 10_000) -> Prediction:
+-    return Prediction(
+-        id="x",
+-        title="Quien gana el mapa?",
+-        outcomes=[
+-            Outcome(id="a", label="TeamA", total_points=leader_points, total_bettors=10),
+-            Outcome(id="b", label="TeamB", total_points=other_points, total_bettors=5),
+-        ],
+-        min_bet=500,
+-        max_bet=5000,
+-        locks_at=datetime.now(timezone.utc),
+-        available_points=balance,
+-        captured_at=datetime.now(timezone.utc),
+-    )
+-
+-
+-def test_above_threshold_bets_high_percentage() -> None:
+-    strategy = FixedPercentageStrategy(threshold=90, high_pct=35, low_pct=20)
+-    # leader has 95% of the pool
+-    decision = strategy.decide(_prediction(leader_points=950, other_points=50))
+-    assert decision.should_bet is True
+-    assert decision.side == "TeamA"
+-    assert decision.amount == 3500
+-
+-
+-def test_at_threshold_bets_low_percentage() -> None:
+-    strategy = FixedPercentageStrategy(threshold=90, high_pct=35, low_pct=20)
+-    decision = strategy.decide(_prediction(leader_points=90, other_points=10))
+-    assert decision.amount == 2000
+-
+-
+-def test_below_threshold_bets_low_percentage() -> None:
+-    strategy = FixedPercentageStrategy(threshold=90, high_pct=35, low_pct=20)
+-    decision = strategy.decide(_prediction(leader_points=50, other_points=50))
+-    assert decision.amount == 2000
+-
+-
+-def test_amount_capped_at_max_bet() -> None:
+-    strategy = FixedPercentageStrategy(threshold=90, high_pct=35, low_pct=20)
+-    decision = strategy.decide(_prediction(leader_points=95, other_points=5, balance=100_000))
+-    assert decision.amount == 5000  # max_bet, not 35_000
+-
+-
+-def test_below_min_bet_means_no_bet() -> None:
+-    strategy = FixedPercentageStrategy(threshold=90, high_pct=35, low_pct=20)
+-    decision = strategy.decide(_prediction(leader_points=50, other_points=50, balance=100))
+-    assert decision.should_bet is False
+-    assert decision.amount == 0

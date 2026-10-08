@@ -1,0 +1,73 @@
+diff --git a/app/bot/prediction_page.py b/app/bot/prediction_page.py
+index 7d6a576..14525bd 100644
+--- a/app/bot/prediction_page.py
++++ b/app/bot/prediction_page.py
+@@ -87,6 +87,11 @@ class _AmountNotAccepted(RuntimeError):
+     this — the site would take whatever the field actually contains."""
+ 
+ 
++class _AmbiguousOutcome(RuntimeError):
++    """More than one outcome card matches the side's label. Raised before any
++    click, so no bet exists."""
++
++
+ class _ConfirmResult(Enum):
+     """Only PLACED is certain. Everything else means "unknown" — the site's bet
+     history showed bets landing that this code had reported as failures, so an
+@@ -433,6 +438,15 @@ class PredictionPageReader:
+                 f"Outcome card for {side!r} never became visible after 3 reloads."
+             )
+ 
++        # has_text is a case-insensitive SUBSTRING match, so "OT" also matches the
++        # "OT 2 o +" card. Nothing is submitted yet, so refusing here is free;
++        # clicking .first could stake on the wrong outcome.
++        matches = await self._page.locator(_OUTCOME_SELECTOR).filter(has_text=side).count()
++        if matches > 1:
++            raise _AmbiguousOutcome(
++                f"{matches} outcome cards contain {side!r} — refusing to guess which one"
++            )
++
+         logger.info("Selecting outcome card for {}", side)
+         await outcome.click(timeout=5000)
+ 
+diff --git a/tests/test_place_bet_flow.py b/tests/test_place_bet_flow.py
+index c54584a..a3276ef 100644
+--- a/tests/test_place_bet_flow.py
++++ b/tests/test_place_bet_flow.py
+@@ -85,7 +85,9 @@ class FakeLocator:
+             return 0
+         if self._name in ("turnstile", "turnstile_widget"):
+             return 1 if self._page.turnstile_checkbox else 0
+-        return 0 if self._name in self._page.never_visible else 1
++        if self._name in self._page.never_visible:
++            return 0
++        return self._page.outcome_matches if self._name == "outcome" else 1
+ 
+     async def evaluate(self, expression: str) -> dict[str, Any]:
+         return {"tag": "BUTTON", "disabled": False}
+@@ -173,6 +175,8 @@ class FakePage:
+         self.typing_is_ignored = False
+         self.attempts = 0
+         self.url = "https://www.forg1.com/predicciones"
++        # How many outcome cards contain the side's label ("OT" is inside "OT 2").
++        self.outcome_matches = 1
+ 
+     def is_closed(self) -> bool:
+         return False
+@@ -266,6 +270,16 @@ def test_missing_outcome_card_retries_the_reload_then_raises() -> None:
+     assert "click:outcome" not in page.events
+ 
+ 
++def test_label_matching_two_cards_is_refused_before_any_click() -> None:
++    # has_text is a substring match: "OT" also matches the "OT 2 o +" card, and
++    # .first would stake on whichever renders first.
++    page = FakePage()
++    page.outcome_matches = 2
++    with pytest.raises(RuntimeError, match="refusing to guess"):
++        asyncio.run(_reader(page).place_bet("OT", 350))
++    assert not any(e.startswith(("click:", "fill:")) for e in page.events)
++
++
+ def test_unclickable_confirm_is_never_retried() -> None:
+     # The site's bet history showed bets landing that the logs called failures:
+     # Confirmar reads `disabled` BECAUSE the bet already went through. Retrying

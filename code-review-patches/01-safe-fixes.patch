@@ -1,0 +1,357 @@
+diff --git a/app/services/kick_service.py b/app/services/kick_service.py
+index 5695b16..5b76f4b 100644
+--- a/app/services/kick_service.py
++++ b/app/services/kick_service.py
+@@ -30,10 +30,10 @@ _FAILURES_BEFORE_ALERT = 3
+ class KickLiveChecker:
+     """Pings Kick's public channel API on an interval.
+ 
+-    When the stream goes live it notifies and, if a browser context is
+-    available, opens Kick after a short delay in a new tab. The delay avoids
+-    racing the initial Forg1 login/bootstrap sequence. When the stream ends it
+-    notifies and closes the tab.
++    When the stream goes live it notifies and launches the stream viewer (a
++    separate plain Chrome process, see _open_stream). When the stream ends it
++    notifies and closes the viewer. Its live/offline state also gates the
++    forg1 poll loop (MonitoringService._stream_offline).
+     """
+ 
+     def __init__(
+@@ -69,14 +69,22 @@ class KickLiveChecker:
+         """True only when the stream is confirmed live (None = unknown yet)."""
+         return self._was_live is True
+ 
++    @property
++    def is_offline(self) -> bool:
++        """True only when a check has CONFIRMED the stream is down. Unknown (no
++        successful check yet, e.g. Kick blocked since startup) is not offline,
++        so a Kick outage never stops the bot from watching forg1."""
++        return self._was_live is False
++
+     async def run(self) -> None:
+         logger.info("Kick live-check started (every {}s).", self._interval)
+         while True:
+             try:
+                 is_live = await asyncio.to_thread(self._check_live)
+             except CloudflareBlocked as exc:
+-                # Silent otherwise: a blocked check means "never live", which
+-                # also stops the balance refresh and the stream tab for good.
++                # The last known state is kept while blocked: if it was never
++                # known the monitor keeps reading forg1; if it was "offline" a
++                # stream that starts during the block goes unseen until it lifts.
+                 await self._alert_blocked(str(exc))
+                 await self._sleep_interval()
+                 continue
+@@ -111,6 +119,8 @@ class KickLiveChecker:
+                 await self._notifier.send("✅ El chequeo de Kick volvió a funcionar.")
+             self._consecutive_failures = 0
+ 
++            if self._was_live is None:
++                logger.info("Kick stream is {} at startup.", "live" if is_live else "offline")
+             if is_live and not self._was_live:
+                 await self._notifier.send(f"🟢 El stream está en vivo: {self._channel_url}")
+                 logger.info("Kick stream went live.")
+diff --git a/app/services/notifier.py b/app/services/notifier.py
+index 61331c0..d10b3f0 100644
+--- a/app/services/notifier.py
++++ b/app/services/notifier.py
+@@ -7,6 +7,7 @@ from typing import Any
+ from loguru import logger
+ 
+ from app.utils import http as http_ipv4
++from app.utils.retry import short_error
+ 
+ 
+ class TelegramNotifier:
+@@ -111,7 +112,7 @@ class TelegramNotifier:
+                 if attempt < self._attempts:
+                     logger.warning(
+                         "Telegram call slow/failed ({}); retrying {}/{}.",
+-                        exc,
++                        short_error(exc),
+                         attempt,
+                         self._attempts - 1,
+                     )
+@@ -122,4 +123,6 @@ class TelegramNotifier:
+         try:
+             self._call(f"{self._api}/sendMessage", payload)
+         except Exception as exc:  # notifications must never take the bot down
+-            logger.error("Telegram send failed after {} attempts: {}", self._attempts, exc)
++            logger.error(
++                "Telegram send failed after {} attempts: {}", self._attempts, short_error(exc)
++            )
+diff --git a/app/strategies/factory.py b/app/strategies/factory.py
+new file mode 100644
+index 0000000..be2ef97
+--- /dev/null
++++ b/app/strategies/factory.py
+@@ -0,0 +1,65 @@
++"""Builds the live strategy from Settings, in one place.
++
++main.py and scripts/dry_run.py both need it, and the dry run used to build its
++own copy that skipped half the dials (unrated weight, OT weight, the form model,
++the form-edge filter), so it printed stakes the live bot would never place.
++"""
++
++from loguru import logger
++
++from app.config.settings import Settings
++from app.services.counter_predictor import CounterPredictor
++from app.services.match_history import MapForm
++from app.services.team_ratings import TeamRatings
++from app.strategies.contrarian_pari_mutuel import ContrarianPariMutuelStrategy
++from app.utils.retry import short_error
++
++
++def build_form_model(settings: Settings) -> CounterPredictor | MapForm:
++    """CounterPredictor when its export exists and loads, MapForm otherwise.
++
++    A truncated or stale-schema export (an interrupted or outdated export) used to
++    crash the bot at startup; it now falls back to MapForm with a loud log line.
++    """
++    try:
++        counter = CounterPredictor.from_file(
++            settings.counterpredictor_path, settings.strategy_form_min_games
++        )
++    except (ValueError, KeyError, TypeError, OSError) as exc:
++        logger.error(
++            "Unreadable CounterPredictor export at {} ({}); falling back to MapForm.",
++            settings.counterpredictor_path,
++            short_error(exc),
++        )
++        counter = None
++    if counter is not None:
++        return counter
++    return MapForm(
++        settings.match_history_path,
++        scale=settings.strategy_form_scale,
++        k_global=settings.strategy_form_k_global,
++        k_map=settings.strategy_form_k_map,
++        min_games=settings.strategy_form_min_games,
++    )
++
++
++def build_strategy(settings: Settings) -> ContrarianPariMutuelStrategy:
++    return ContrarianPariMutuelStrategy(
++        crowd_weight=settings.strategy_crowd_weight,
++        kelly_fraction=settings.strategy_kelly_fraction,
++        max_pct=settings.strategy_max_pct,
++        min_edge=settings.strategy_min_edge,
++        rating_weight=settings.strategy_rating_weight,
++        max_outcomes=settings.strategy_max_outcomes,
++        unrated_crowd_weight=settings.strategy_unrated_crowd_weight,
++        ot_crowd_weight=settings.strategy_ot_crowd_weight,
++        always_back=tuple(
++            name.strip() for name in settings.strategy_always_back.split(",") if name.strip()
++        ),
++        ratings=TeamRatings(settings.team_ratings_path, settings.strategy_rating_scale),
++        # Built even when form_weight is 0 so the log line reports what the
++        # model WOULD know.
++        form=build_form_model(settings),
++        form_weight=settings.strategy_form_weight,
++        min_form_edge=settings.strategy_min_form_edge,
++    )
+diff --git a/main.py b/main.py
+index b60bf4c..0826574 100644
+--- a/main.py
++++ b/main.py
+@@ -1,6 +1,7 @@
+ import asyncio
+ import contextlib
+ import signal
++import traceback
+ from collections.abc import Awaitable, Callable
+ 
+ from loguru import logger
+@@ -14,15 +15,19 @@ from app.services.kick_service import KickLiveChecker
+ from app.services.monitoring_service import MonitoringService
+ from app.services.notifier import TelegramNotifier
+ from app.services.telegram_commands import TelegramCommandListener
+-from app.services.counter_predictor import CounterPredictor
+-from app.services.match_history import MapForm
+-from app.services.team_ratings import TeamRatings
+ from app.strategies.base_strategy import BettingStrategy
+-from app.strategies.contrarian_pari_mutuel import ContrarianPariMutuelStrategy
++from app.strategies.factory import build_strategy
+ from app.utils.logger import setup_logger
+ from app.utils.retry import short_error
+ 
+ 
++def _frames(exc: BaseException) -> str:
++    """Where it crashed, without the exception text. logger.exception() would
++    print str(exc) in full, and a Playwright error's "Call log" carries the
++    forg1_session cookie (see short_error)."""
++    return "".join(traceback.format_tb(exc.__traceback__)).rstrip()
++
++
+ async def _run_forever(name: str, coro_factory: Callable[[], Awaitable[None]]) -> None:
+     """Top-level safety net: a service that raises past its own internal
+     handling gets logged and restarted instead of taking the process down."""
+@@ -30,7 +35,9 @@ async def _run_forever(name: str, coro_factory: Callable[[], Awaitable[None]]) -
+         try:
+             await coro_factory()
+         except Exception as exc:
+-            logger.exception("{} crashed, restarting in 10s: {}", name, exc)
++            logger.error(
++                "{} crashed, restarting in 10s: {}\n{}", name, short_error(exc), _frames(exc)
++            )
+             await asyncio.sleep(10)
+ 
+ 
+@@ -88,9 +95,10 @@ async def _browser_session(
+             bankroll_stop_pct=settings.bankroll_stop_pct,
+             results_log_path=settings.results_log_path,
+             resolve_maps=settings.resolve_map_names,
+-            # balance-refresh clicks only happen while the stream is live —
+-            # no automated clicking around the clock for Cloudflare to flag.
+-            stream_is_live=lambda: kick_checker.is_live,
++            # Reads and balance-refresh clicks pause only while Kick CONFIRMS the
++            # stream is offline — no automated traffic around the clock for
++            # Cloudflare to flag, and an unknown Kick state never blinds the bot.
++            stream_is_live=lambda: not kick_checker.is_offline,
+         )
+ 
+         commands = TelegramCommandListener(notifier, reset)
+@@ -125,34 +133,7 @@ async def main() -> None:
+         settings.telegram_attempts,
+     )
+     await notifier.connect()  # fail fast: no Telegram, no bot
+-    strategy = ContrarianPariMutuelStrategy(
+-        crowd_weight=settings.strategy_crowd_weight,
+-        kelly_fraction=settings.strategy_kelly_fraction,
+-        max_pct=settings.strategy_max_pct,
+-        min_edge=settings.strategy_min_edge,
+-        rating_weight=settings.strategy_rating_weight,
+-        max_outcomes=settings.strategy_max_outcomes,
+-        unrated_crowd_weight=settings.strategy_unrated_crowd_weight,
+-        ot_crowd_weight=settings.strategy_ot_crowd_weight,
+-        always_back=tuple(
+-            name.strip() for name in settings.strategy_always_back.split(",") if name.strip()
+-        ),
+-        ratings=TeamRatings(settings.team_ratings_path, settings.strategy_rating_scale),
+-        # CounterPredictor when its export exists, MapForm otherwise. Built even
+-        # when form_weight is 0 so the log line reports what the model WOULD know.
+-        form=CounterPredictor.from_file(
+-            settings.counterpredictor_path, settings.strategy_form_min_games
+-        )
+-        or MapForm(
+-            settings.match_history_path,
+-            scale=settings.strategy_form_scale,
+-            k_global=settings.strategy_form_k_global,
+-            k_map=settings.strategy_form_k_map,
+-            min_games=settings.strategy_form_min_games,
+-        ),
+-        form_weight=settings.strategy_form_weight,
+-        min_form_edge=settings.strategy_min_form_edge,
+-    )
++    strategy = build_strategy(settings)
+ 
+     stop = asyncio.Event()
+     loop = asyncio.get_running_loop()
+@@ -171,7 +152,7 @@ async def main() -> None:
+                 await notifier.send(f"🛑 Bot detenido: {exc}")
+             raise SystemExit(1)
+         except Exception as exc:
+-            logger.exception("Browser session crashed: {}", short_error(exc))
++            logger.error("Browser session crashed: {}\n{}", short_error(exc), _frames(exc))
+         if stop.is_set():
+             break
+         relaunches += 1
+diff --git a/scripts/dry_run.py b/scripts/dry_run.py
+index 6f547d6..a43fa3c 100644
+--- a/scripts/dry_run.py
++++ b/scripts/dry_run.py
+@@ -17,21 +17,12 @@ from app.bot.browser import persistent_context
+ from app.bot.login import ensure_logged_in
+ from app.bot.prediction_page import PredictionPageReader
+ from app.config.settings import Settings
+-from app.services.team_ratings import TeamRatings
+-from app.strategies.contrarian_pari_mutuel import ContrarianPariMutuelStrategy
++from app.strategies.factory import build_strategy
+ 
+ 
+ async def main() -> int:
+     settings = Settings()  # type: ignore[call-arg]
+-    strategy = ContrarianPariMutuelStrategy(
+-        crowd_weight=settings.strategy_crowd_weight,
+-        kelly_fraction=settings.strategy_kelly_fraction,
+-        max_pct=settings.strategy_max_pct,
+-        min_edge=settings.strategy_min_edge,
+-        rating_weight=settings.strategy_rating_weight,
+-        max_outcomes=settings.strategy_max_outcomes,
+-        ratings=TeamRatings(settings.team_ratings_path, settings.strategy_rating_scale),
+-    )
++    strategy = build_strategy(settings)  # exactly what main.py runs
+ 
+     async with persistent_context(settings.chrome_profile_dir, settings.headless) as context:
+         print("Chrome up. Checking the forg1 session (may ask you to log in)…")
+diff --git a/tests/test_factory.py b/tests/test_factory.py
+new file mode 100644
+index 0000000..f572452
+--- /dev/null
++++ b/tests/test_factory.py
+@@ -0,0 +1,64 @@
++"""The live strategy is built in one place (main.py and dry_run.py share it)."""
++
++import json
++from pathlib import Path
++
++from app.config.settings import Settings
++from app.services.counter_predictor import CounterPredictor
++from app.services.kick_service import KickLiveChecker
++from app.services.match_history import MapForm
++from app.strategies.factory import build_form_model, build_strategy
++from tests.test_counter_predictor import SNAPSHOT
++
++
++def _settings(tmp_path: Path, **overrides: object) -> Settings:
++    return Settings(
++        _env_file=None,  # type: ignore[call-arg]
++        telegram_bot_token="x",
++        counterpredictor_path=tmp_path / "counterpredictor.json",
++        match_history_path=tmp_path / "missing_history.json",
++        team_ratings_path=tmp_path / "missing_ratings.json",
++        **overrides,
++    )
++
++
++def test_counterpredictor_export_wins_when_present(tmp_path: Path) -> None:
++    settings = _settings(tmp_path)
++    settings.counterpredictor_path.write_text(json.dumps(SNAPSHOT))
++    assert isinstance(build_form_model(settings), CounterPredictor)
++
++
++def test_truncated_export_falls_back_to_mapform_instead_of_crashing(tmp_path: Path) -> None:
++    settings = _settings(tmp_path)
++    settings.counterpredictor_path.write_text(json.dumps(SNAPSHOT)[:200])
++    assert isinstance(build_form_model(settings), MapForm)
++
++
++def test_export_missing_a_key_falls_back_to_mapform(tmp_path: Path) -> None:
++    settings = _settings(tmp_path)
++    settings.counterpredictor_path.write_text(json.dumps({"teams": {}}))
++    assert isinstance(build_form_model(settings), MapForm)
++
++
++def test_strategy_gets_every_dial(tmp_path: Path) -> None:
++    settings = _settings(
++        tmp_path,
++        strategy_unrated_crowd_weight=0.85,
++        strategy_form_weight=0.3,
++        strategy_min_form_edge=0.05,
++        strategy_always_back=" 9z , ,FURIA",
++    )
++    strategy = build_strategy(settings)
++    assert strategy._unrated_crowd_weight == 0.85
++    assert strategy._form_weight == 0.3
++    assert strategy._min_form_edge == 0.05
++    assert strategy._always_back == ("9z", "FURIA")
++
++
++def test_unknown_kick_state_is_not_offline() -> None:
++    checker = KickLiveChecker("forg1", 30, notifier=None)  # type: ignore[arg-type]
++    assert not checker.is_offline  # no successful check yet
++    checker._was_live = False
++    assert checker.is_offline
++    checker._was_live = True
++    assert not checker.is_offline
