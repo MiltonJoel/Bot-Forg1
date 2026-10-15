@@ -26,6 +26,12 @@ class Prediction(BaseModel):
     locks_at: datetime
     available_points: int  # the account's own balance ("Tu balance"), not the pool
     captured_at: datetime
+    # Which CS2 map this market is about ("inferno"), when it could be worked
+    # out. Forg1 almost never says — titles read "2do MAPA" — so it is resolved
+    # from bo3.gg by app/services/map_resolver.py before the strategy runs, and
+    # stays None whenever that is not certain. Strategies must treat None as
+    # "no map information", never as a default map.
+    map_name: str | None = None
 
     @property
     def total_pool(self) -> int:
@@ -44,9 +50,13 @@ class Prediction(BaseModel):
 
 
 class BetDecision(BaseModel):
-    """What a strategy recommends. The read-only bot only ever notifies this."""
+    """What a strategy recommends. MonitoringService places it on the live UI
+    and reports the outcome — this is not a suggestion-only object."""
 
     should_bet: bool
     side: str | None
     amount: int
     reason: str
+    # True when the edge model sat out and the bet backs the crowd favourite
+    # instead (STRATEGY_FAV_FALLBACK_PCT). Reported on Telegram and in results.jsonl.
+    fallback: bool = False

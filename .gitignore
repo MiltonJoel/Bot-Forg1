@@ -1,6 +1,8 @@
 # --- Secrets & runtime state (never commit) ---
-# real secrets; .env.example IS tracked
+# real secrets; .env.example IS tracked (backups like .env.bak-* covered too)
 .env
+.env.*
+!.env.example
 # Chrome profile + session cookies (~1.7G, sensitive)
 .auth/
 # seen-predictions state, etc.
@@ -28,3 +30,6 @@ htmlcov/
 .idea/
 .vscode/
 .DS_Store
+
+# stray Chrome profile created by an unexpanded "~" path
+/~/

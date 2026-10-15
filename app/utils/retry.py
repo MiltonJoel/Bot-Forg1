@@ -1,24 +1,36 @@
+import re
+
 from loguru import logger
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 from playwright.async_api import Error as PlaywrightError
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+
+def short_error(exc: BaseException | None) -> str:
+    """First line of an exception, safe to write to a log file.
+
+    NEVER log a Playwright exception directly. Its "Call log" embeds the full
+    request headers, and those headers carry `forg1_session` — the actual login
+    cookie. `logger.error("... ({})", exc)` in the monitor's read handler wrote
+    a live session cookie into logs/forg1_monitor.log in plaintext, where it sat
+    until someone pasted the log somewhere. The first line carries the whole
+    diagnosis ("getaddrinfo ENOTFOUND www.forg1.com") and none of the secret.
+    """
+    if exc is None:
+        return repr(exc)
+    first = str(exc).splitlines()[0] if str(exc) else repr(exc)
+    # Belt and braces: if a future Playwright version ever puts headers on line
+    # one, redact rather than leak.
+    return _COOKIE_RE.sub("<redacted>", first)
+
+
+_COOKIE_RE = re.compile(r"(forg1_session|cookie)\s*[=:]\s*\S+", re.IGNORECASE)
 
 
 def _log_retry(retry_state: object) -> None:
-    """Log a one-line retry reason.
-
-    Playwright errors embed a full "Call log" that includes the request headers —
-    and those headers carry the forg1 session cookie. Dumping the whole exception
-    (as tenacity's before_sleep_log does) writes that cookie to the log file in
-    plaintext. Log only the first line so credentials never land on disk.
-    """
+    """Log a one-line retry reason (see short_error for why it must be short)."""
     outcome = getattr(retry_state, "outcome", None)
     exc = outcome.exception() if outcome else None
-    reason = str(exc).splitlines()[0] if exc else repr(exc)
+    reason = short_error(exc)
     fn = getattr(retry_state, "fn", None)
     logger.warning(
         "Retrying {} (attempt {}) after: {}",

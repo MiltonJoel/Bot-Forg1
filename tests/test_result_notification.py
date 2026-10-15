@@ -79,7 +79,8 @@ def test_result_loss(tmp_path: Path) -> None:
 
 def test_result_no_bet(tmp_path: Path) -> None:
     m, notifier = _monitor(tmp_path, balance=10_000)
-    decision = BetDecision(should_bet=False, side=None, amount=0, reason="x")
+    reason = "3-way market (limit 2)"
+    decision = BetDecision(should_bet=False, side=None, amount=0, reason=reason)
     asyncio.run(m._notify_result(_prediction(), decision, "TeamA"))
     msg = notifier.sent[-1]
-    assert "no se había sugerido apuesta" in msg
+    assert f"no aposté ({reason})" in msg

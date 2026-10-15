@@ -14,17 +14,26 @@ from app.services.notifier import TelegramNotifier
 _LOGGED_OUT_MARKER = "conectar con kick"
 
 
-async def looks_logged_out(page: Page, url: str) -> bool:
-    """Server-authoritative login check: reads forg1's own SSR response rather
-    than the post-hydration DOM (which can momentarily show either state)."""
-    resp = await page.request.get(url)
-    body = await resp.text()
+def is_logged_out_html(body: str) -> bool:
+    """Login state from forg1's own SSR response body.
+
+    Caller beware: a Cloudflare challenge page carries neither the flag nor the
+    marker and therefore reads as LOGGED IN here. Callers that can be blocked
+    must check for that first (PredictionPageReader does, via _fetch_html).
+    """
     flat = body.replace("\\", "")  # the flag is embedded inside an escaped RSC string
     if '"isLoggedIn":true' in flat:
         return False
     if '"isLoggedIn":false' in flat:
         return True
     return _LOGGED_OUT_MARKER in body.lower()
+
+
+async def looks_logged_out(page: Page, url: str) -> bool:
+    """Server-authoritative login check: reads forg1's own SSR response rather
+    than the post-hydration DOM (which can momentarily show either state)."""
+    response = await page.request.get(url)
+    return is_logged_out_html(await response.text())
 
 
 async def _restore_session(context: BrowserContext, storage_state_path: Path) -> None:

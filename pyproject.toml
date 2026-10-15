@@ -1,7 +1,7 @@
 [project]
 name = "forg1-monitor"
 version = "0.1.0"
-description = "Read-only monitor for forg1.com predictions: detects new predictions, computes a suggested bet, and pushes it to Telegram. Never places bets."
+description = "Betting bot for forg1.com predictions: detects new predictions, sizes a fractional-Kelly bet, places it on the live UI via Playwright, and reports to Telegram."
 requires-python = ">=3.13"
 dependencies = [
     "playwright>=1.45",

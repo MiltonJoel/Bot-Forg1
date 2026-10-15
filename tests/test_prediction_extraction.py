@@ -81,6 +81,17 @@ def test_bettable_only_while_open_and_unlocked() -> None:
     assert _is_bettable({"status": "open"}, now)
 
 
+def test_truncated_chunk_does_not_loop_forever() -> None:
+    # A chunk that starts mid-object: its enclosing "{" went out in an earlier
+    # push, so the brace scan finds no wrapper and the forward scan closes a
+    # SIBLING object before the "outcomes" key it started from. Advancing the
+    # cursor to that closing brace rewinds it, and the same match is re-found
+    # forever — a silent hang of the whole poll loop. It must simply return.
+    body = json.dumps('2a:[{"id":"frag"},"outcomes":[{"id":"o"}]]')[1:-1]
+    html = f'<script>self.__next_f.push([1,"{body}"])</script>'
+    assert _extract_prediction_objects(html) == []
+
+
 def test_valid_prediction_rejects_fragments() -> None:
     # a full prediction passes
     assert _is_valid_prediction(_OPEN)
