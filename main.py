@@ -98,6 +98,7 @@ async def _browser_session(
             results_log_path=settings.results_log_path,
             skipped_log_path=settings.skipped_log_path,
             resolve_maps=settings.resolve_map_names,
+            polymarket_lookup=settings.polymarket_lookup,
             # Reads and balance-refresh clicks pause only while Kick CONFIRMS the
             # stream is offline — no automated traffic around the clock for
             # Cloudflare to flag, and an unknown Kick state never blinds the bot.

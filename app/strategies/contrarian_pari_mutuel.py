@@ -77,6 +77,7 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
         form_weight: float = 0.0,
         min_form_edge: float | None = None,
         fav_fallback_pct: float = 0.0,
+        fav_fallback_max_share: float = 1.0,
     ) -> None:
         if not 0.0 <= crowd_weight <= 1.0:
             raise ValueError("crowd_weight must be between 0 and 1")
@@ -102,6 +103,8 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
             raise ValueError("min_form_edge needs form_weight > 0")
         if not 0.0 <= fav_fallback_pct <= 1.0:
             raise ValueError("fav_fallback_pct must be between 0 and 1")
+        if not 0.0 < fav_fallback_max_share <= 1.0:
+            raise ValueError("fav_fallback_max_share must be in (0, 1]")
 
         self._crowd_weight = crowd_weight
         self._kelly_fraction = kelly_fraction
@@ -117,6 +120,7 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
         self._form_weight = form_weight
         self._min_form_edge = min_form_edge
         self._fav_fallback_pct = fav_fallback_pct
+        self._fav_fallback_max_share = fav_fallback_max_share
 
     def replace_form(self, form: MapForm | CounterPredictor) -> None:
         """Swap in a re-exported form model (Telegram /actualizarmodelo). Weight
@@ -135,7 +139,9 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
         back the crowd favourite instead — the outcome holding the most pool at
         decision time — with a flat `fav_fallback_pct` of the balance, capped by
         the site's max_bet. A tie for the top spot has no favourite and is
-        skipped, as is a stake below min_bet.
+        skipped, as is a stake below min_bet, and so is a favourite holding
+        `fav_fallback_max_share` or more of the pool (2026-10-18: an 80% favourite
+        pays 0.25x, and the 79,313 stake lost on one was the cycle's worst bet).
 
         The declined reason is kept FIRST in the new reason: the monitor's
         results_skipped.jsonl log keys on it starting with "N-way market", so a
@@ -146,6 +152,15 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
         if len(ranked) < 2 or first.total_points == ranked[1].total_points:
             return declined.model_copy(
                 update={"reason": f"{declined.reason} — favourite fallback: top two tied, skipped"}
+            )
+        share = self._share(prediction, first)
+        if share >= self._fav_fallback_max_share:
+            return declined.model_copy(
+                update={
+                    "reason": f"{declined.reason} — favourite fallback skipped: {first.label} "
+                    f"holds {share * 100:.1f}% of the pool "
+                    f"(limit {self._fav_fallback_max_share * 100:.0f}%)"
+                }
             )
         amount = min(
             int(prediction.available_points * self._fav_fallback_pct),
@@ -159,7 +174,6 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
                     f"< min_bet {prediction.min_bet}, skipped"
                 }
             )
-        share = self._share(prediction, first)
         payout = self._net_odds(prediction.total_pool, first.total_points, amount)
         return BetDecision(
             should_bet=True,
@@ -203,7 +217,8 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
                     side=None,
                     amount=0,
                     reason=(
-                        f"form model does not back {outcome.label}: "
+                        ("Polymarket" if self._polymarket_priced(prediction) else "form model")
+                        + f" does not back {outcome.label}: "
                         + ("no opinion" if form_edge is None else f"{form_edge * 100:+.1f} pts")
                         + f" over its pool share (need {self._min_form_edge * 100:+.1f})"
                         + " — sitting out"
@@ -238,9 +253,19 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
             reason=(
                 ("standing order: always back this team — " if forced is not None else "")
                 + f"{outcome.label} holds {share * 100:.1f}% of the pool -> pays {payout:.2f}x; "
-                f"model p={probability:.2f} -> edge {edge:+.2f}, stake {amount} "
+                f"model p={probability:.2f}"
+                + (" (Polymarket in the blend)" if self._polymarket_priced(prediction) else "")
+                + f" -> edge {edge:+.2f}, stake {amount} "
                 f"({amount / prediction.available_points * 100:.1f}% of balance)"
             ),
+        )
+
+    def _polymarket_priced(self, prediction: Prediction) -> bool:
+        """Did Polymarket fill the form slot? For the decision reason."""
+        teams = [o for o in prediction.outcomes if o not in self._overtime_outcomes(prediction)]
+        return (
+            self._form_weight > 0
+            and self._polymarket_pair(teams, prediction.polymarket) is not None
         )
 
     # --- pricing -------------------------------------------------------------
@@ -322,7 +347,7 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
         if len(teams) != 2 or outcome not in teams:
             return None
         inner = sum(o.total_points for o in teams)
-        probabilities = self._form_probabilities(teams, prediction.map_name)
+        probabilities = self._form_probabilities(teams, prediction.map_name, prediction.polymarket)
         if probabilities is None or inner <= 0:
             return None
         return probabilities[teams.index(outcome)] - outcome.total_points / inner
@@ -350,7 +375,10 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
         overtime = self._overtime_outcomes(prediction)
         if not overtime:
             return self._shrunk(
-                prediction.outcomes, float(prediction.total_pool), prediction.map_name
+                prediction.outcomes,
+                float(prediction.total_pool),
+                prediction.map_name,
+                prediction.polymarket,
             )
 
         uniform = 1.0 / len(prediction.outcomes)
@@ -371,7 +399,10 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
         conditional = iter(
             (1.0 - total_overtime) * p
             for p in self._shrunk(
-                teams, float(sum(o.total_points for o in teams)), prediction.map_name
+                teams,
+                float(sum(o.total_points for o in teams)),
+                prediction.map_name,
+                prediction.polymarket,
             )
         )
         return [
@@ -380,7 +411,11 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
         ]
 
     def _shrunk(
-        self, outcomes: list[Outcome], pool: float, map_name: str | None = None
+        self,
+        outcomes: list[Outcome],
+        pool: float,
+        map_name: str | None = None,
+        polymarket: dict[str, float] | None = None,
     ) -> list[float]:
         """Pool shares shrunk toward uniform, with Valve's rating blended in for
         a head-to-head between two ranked teams. Sums to 1.
@@ -403,7 +438,9 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
             return [uniform] * len(outcomes)
         rated = self._both_rated(outcomes)
         weight = (
-            self._crowd_weight if self._is_team_market(outcomes) else self._unrated_crowd_weight
+            self._crowd_weight
+            if self._is_team_market(outcomes, polymarket)
+            else self._unrated_crowd_weight
         )
         crowd = [uniform + weight * (o.total_points / pool - uniform) for o in outcomes]
 
@@ -414,7 +451,7 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
         # model — an unranked team must not silently double MapForm's say.
         sources = [
             (self._rating_weight, self._rating_probabilities(outcomes) if rated else None),
-            (self._form_weight, self._form_probabilities(outcomes, map_name)),
+            (self._form_weight, self._form_probabilities(outcomes, map_name, polymarket)),
         ]
         available = [(w, p) for w, p in sources if w > 0.0 and p is not None]
         if not available:
@@ -428,7 +465,9 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
         total = sum(blended)
         return [b / total for b in blended]
 
-    def _is_team_market(self, outcomes: list[Outcome]) -> bool:
+    def _is_team_market(
+        self, outcomes: list[Outcome], polymarket: dict[str, float] | None = None
+    ) -> bool:
         """Is this a match between two teams (rather than a kill count or a
         one-off question)? That is what picks `crowd_weight` over
         `unrated_crowd_weight` — a distinction about the market's TYPE, not
@@ -441,7 +480,10 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
         """
         if self._both_rated(outcomes):
             return True
-        return self._form_weight > 0.0 and self._form_rates_both(outcomes)
+        return self._form_weight > 0.0 and (
+            self._polymarket_pair(outcomes, polymarket) is not None
+            or self._form_rates_both(outcomes)
+        )
 
     def _rating_probabilities(self, outcomes: list[Outcome]) -> list[float] | None:
         """Head-to-head win probability from Valve's standings, or None when
@@ -465,8 +507,23 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
         first, second = outcomes
         return self._form.win_probability(first.label, second.label) is not None
 
+    @staticmethod
+    def _polymarket_pair(
+        outcomes: list[Outcome], polymarket: dict[str, float] | None
+    ) -> list[float] | None:
+        """Polymarket's [P(first), P(second)] when it priced exactly these two
+        teams, else None."""
+        if not polymarket or len(outcomes) != 2:
+            return None
+        if not all(o.label in polymarket for o in outcomes):
+            return None
+        return [polymarket[outcomes[0].label], polymarket[outcomes[1].label]]
+
     def _form_probabilities(
-        self, outcomes: list[Outcome], map_name: str | None
+        self,
+        outcomes: list[Outcome],
+        map_name: str | None,
+        polymarket: dict[str, float] | None = None,
     ) -> list[float] | None:
         """Head-to-head win probability from bo3.gg match history, on this map
         where we know it, or None when this isn't two teams MapForm knows.
@@ -474,8 +531,19 @@ class ContrarianPariMutuelStrategy(BettingStrategy):
         `map_name` is None for most markets — forg1's titles say "2do MAPA",
         not which map — and MapForm then answers with the teams' overall
         strength. That is a weaker answer, not a wrong one.
+
+        Polymarket's price for this exact map comes FIRST when the monitor
+        found a certain match (owner's decision 2026-10-19: it beats the form
+        model, and blending the two did not help in CounterPredictor's tests).
+        It takes the form model's slot, so form_weight and min_form_edge apply
+        to it unchanged.
         """
-        if self._form is None or self._form_weight <= 0 or len(outcomes) != 2:
+        if self._form_weight <= 0 or len(outcomes) != 2:
+            return None
+        market = self._polymarket_pair(outcomes, polymarket)
+        if market is not None:
+            return market
+        if self._form is None:
             return None
         first, second = outcomes
         probability = self._form.win_probability(first.label, second.label, map_name)

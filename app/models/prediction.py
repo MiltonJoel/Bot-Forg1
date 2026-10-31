@@ -32,6 +32,10 @@ class Prediction(BaseModel):
     # stays None whenever that is not certain. Strategies must treat None as
     # "no map information", never as a default map.
     map_name: str | None = None
+    # Polymarket's probability per team label for this exact map, attached by
+    # app/services/polymarket.py before the strategy runs. None whenever the
+    # match is not certain; the strategy then prices exactly as before.
+    polymarket: dict[str, float] | None = None
 
     @property
     def total_pool(self) -> int:

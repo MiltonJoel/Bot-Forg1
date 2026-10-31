@@ -89,3 +89,39 @@ def test_fallback_is_marked_in_results_log_and_result_message(tmp_path: Path) ->
     record = json.loads((tmp_path / "results.jsonl").read_text())
     assert record["fallback"] is True and record["bet_side"] == "TeamA"
     assert "respaldo al favorito" in notifier.sent[-1]
+
+
+def test_fallback_skips_a_favourite_at_or_above_the_max_share() -> None:
+    strategy = ContrarianPariMutuelStrategy(
+        **_FAIR, fav_fallback_pct=0.25, fav_fallback_max_share=0.75
+    )
+    decision = strategy.decide(_prediction(("Falcons", 800_000), ("BB TEAM", 200_000)))
+    assert not decision.should_bet and not decision.fallback
+    assert decision.reason.startswith("no edge")
+    assert decision.reason.endswith(
+        "favourite fallback skipped: Falcons holds 80.0% of the pool (limit 75%)"
+    )
+    # The limit itself is "at or above".
+    at_limit = strategy.decide(_prediction(("A", 750_000), ("B", 250_000)))
+    assert not at_limit.should_bet and "skipped: A holds 75.0%" in at_limit.reason
+
+
+def test_fallback_still_bets_a_favourite_under_the_max_share() -> None:
+    strategy = ContrarianPariMutuelStrategy(
+        **_FAIR, fav_fallback_pct=0.25, fav_fallback_max_share=0.75
+    )
+    decision = strategy.decide(_prediction(("A", 740_000), ("B", 260_000), balance=20_000))
+    assert decision.should_bet and decision.fallback
+    assert decision.side == "A" and decision.amount == 5_000
+
+
+def test_default_max_share_keeps_betting_heavy_favourites() -> None:
+    strategy = ContrarianPariMutuelStrategy(**_FAIR, fav_fallback_pct=0.25)
+    decision = strategy.decide(_prediction(("A", 800_000), ("B", 200_000)))
+    assert decision.should_bet and decision.fallback and decision.side == "A"
+
+
+def test_max_share_out_of_range_is_refused() -> None:
+    for bad in (0.0, 1.5):
+        with pytest.raises(ValueError):
+            ContrarianPariMutuelStrategy(fav_fallback_max_share=bad)

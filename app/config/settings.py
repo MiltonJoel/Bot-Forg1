@@ -151,6 +151,11 @@ class Settings(BaseSettings):
     # usable overall-strength prediction) whenever it fails. Irrelevant while
     # strategy_form_weight is 0, since nothing reads the map then.
     resolve_map_names: bool = True
+    # Look up Polymarket's price for the same map ("Map 2 Winner") and use it in
+    # place of the form model's probability when both teams match exactly
+    # (app/services/polymarket.py). Takes the form model's slot, so
+    # strategy_form_weight and strategy_min_form_edge still govern it.
+    polymarket_lookup: bool = True
     # Only bet markets with at most this many outcomes. The crowd calibration
     # was measured head-to-head; all four multi-way bets in the logs lost.
     strategy_max_outcomes: int = 2
@@ -170,6 +175,9 @@ class Settings(BaseSettings):
     # When the strategy sits out, back the pool favourite with this fraction of
     # the balance (capped by the site's max_bet). 0 = off. Ties are skipped.
     strategy_fav_fallback_pct: float = 0.0
+    # ...but not when the favourite already holds this share of the pool or
+    # more (0.75 = skip 75%+ favourites, which pay 0.33x or less). 1.0 = off.
+    strategy_fav_fallback_max_share: float = 1.0
     team_ratings_path: Path = Path(".data/team_ratings.json")
 
     # Kill switch: stop betting once the balance falls this far below the

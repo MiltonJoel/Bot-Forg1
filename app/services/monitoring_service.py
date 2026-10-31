@@ -13,7 +13,8 @@ from app.utils.retry import short_error
 
 from app.bot.prediction_page import PredictionPageReader
 from app.models.prediction import BetDecision, Prediction
-from app.services.map_resolver import resolve_live_map
+from app.services import polymarket
+from app.services.map_resolver import map_number_in_title, resolve_live_map
 from app.services.notifier import TelegramNotifier
 from app.strategies.base_strategy import BettingStrategy
 from app.strategies.contrarian_pari_mutuel import _OVERTIME_RE
@@ -51,6 +52,7 @@ class MonitoringService:
         results_log_path: Path | None = None,
         skipped_log_path: Path | None = None,
         resolve_maps: bool = False,
+        polymarket_lookup: bool = False,
         stream_is_live: Callable[[], bool] | None = None,
     ) -> None:
         self._reader = reader
@@ -71,6 +73,7 @@ class MonitoringService:
         # Off by default so tests and any embedder never reach the network
         # implicitly; main.py turns it on from settings.resolve_map_names.
         self._resolve_maps = resolve_maps
+        self._polymarket_lookup = polymarket_lookup
         self._stream_is_live = stream_is_live
         # Kill switch state: the balance this session opened with, and whether
         # we have already stopped betting because of a drawdown.
@@ -217,6 +220,29 @@ class MonitoringService:
             logger.info("{} is being played on {}.", prediction.title, map_name)
         return prediction.model_copy(update={"map_name": map_name})
 
+    async def _with_polymarket(self, prediction: Prediction) -> Prediction:
+        """Attach Polymarket's price for this exact map, when the match is
+        certain (see app/services/polymarket.py). Best-effort like the map
+        lookup: any failure or doubt leaves `polymarket` as None and the
+        strategy prices exactly as it did before."""
+        if not self._polymarket_lookup:
+            return prediction
+        labels = tuple(o.label for o in prediction.outcomes if not _OVERTIME_RE.match(o.label))
+        number = map_number_in_title(prediction.title)
+        if len(labels) != 2 or number is None:
+            return prediction
+        try:
+            found = await asyncio.to_thread(
+                polymarket.map_probability, (labels[0], labels[1]), number
+            )
+        except Exception as exc:  # never let a price lookup stop a bet
+            logger.debug("Polymarket lookup failed for {}: {}", prediction.id, short_error(exc))
+            return prediction
+        logger.info(
+            "Polymarket for {} map {}: {}", " vs ".join(labels), number, found or "no exact match"
+        )
+        return prediction.model_copy(update={"polymarket": found})
+
     async def _handle_prediction(self, prediction: Prediction) -> None:
         # Mark it immediately so the same snapshot is not re-stabilized on the
         # next polling cycle while we wait for the pool to settle.
@@ -229,6 +255,7 @@ class MonitoringService:
         prediction = stabilized
 
         prediction = await self._with_map_name(prediction)
+        prediction = await self._with_polymarket(prediction)
 
         decision = self._strategy.decide(prediction)
         logger.info(
@@ -360,6 +387,7 @@ class MonitoringService:
             # Which map it was, when we could tell — this is what lets
             # scripts/analyze_results.py score MapForm per map after the fact.
             "map": prediction.map_name,
+            "polymarket": prediction.polymarket,
             "bet_side": decision.side if decision.should_bet else None,
             "bet_amount": decision.amount if decision.should_bet else 0,
             "fallback": decision.fallback,

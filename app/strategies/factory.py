@@ -63,4 +63,5 @@ def build_strategy(settings: Settings) -> ContrarianPariMutuelStrategy:
         form_weight=settings.strategy_form_weight,
         min_form_edge=settings.strategy_min_form_edge,
         fav_fallback_pct=settings.strategy_fav_fallback_pct,
+        fav_fallback_max_share=settings.strategy_fav_fallback_max_share,
     )
