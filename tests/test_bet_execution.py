@@ -15,9 +15,9 @@ class FakeReader:
         self.reads = 0
         self.refreshes = 0
 
-    async def read_active_prediction(self) -> None:
+    async def read_open_predictions(self) -> list[Prediction]:
         self.reads += 1
-        return None
+        return []
 
     async def refresh(self) -> None:
         self.refreshes += 1
@@ -25,7 +25,7 @@ class FakeReader:
     async def read_resolution(self, prediction_id: str) -> None:
         return None  # still open
 
-    async def place_bet(self, side: str, amount: int) -> bool:
+    async def place_bet(self, side: str, amount: int, **_: Any) -> bool:
         self.bets.append((side, amount))
         return self.succeeds
 
@@ -216,10 +216,9 @@ def test_poll_loop_keeps_running_for_a_pending_result(tmp_path: Any) -> None:
     reader, notifier = FakeReader(), FakeNotifier()
     monitor = _monitor(tmp_path, reader, notifier, bet=False)
     monitor._stream_is_live = lambda: False
-    monitor._pending = (
-        _prediction(),
-        BetDecision(should_bet=True, side="A", amount=350, reason=""),
-    )
+    monitor._pending = {
+        "abc123": (_prediction(), BetDecision(should_bet=True, side="A", amount=350, reason=""))
+    }
 
     _run_briefly(monitor.run())
 

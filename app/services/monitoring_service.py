@@ -24,6 +24,10 @@ from app.utils.http import CloudflareBlocked
 # of failed reads before Telegram hears about it.
 _READ_FAILURES_BEFORE_ALERT = 5
 
+# Market ids remembered as already handled. forg1 can run several markets at
+# once since 2026-10-31, so one "last id" is not enough; this bounds the file.
+_SEEN_IDS_KEPT = 200
+
 # Markets the strategy refuses by shape ("4-way market (limit 2); ..."), the
 # ones results_skipped.jsonl observes. ponytail: keyed on the reason text from
 # ContrarianPariMutuelStrategy._unbettable_reason; if that wording changes the
@@ -67,9 +71,9 @@ class MonitoringService:
         self._bankroll_stop_pct = bankroll_stop_pct
         self._results_log_path = results_log_path
         self._skipped_log_path = skipped_log_path
-        # Every distinct pool the pending market showed while open, for
-        # results_skipped.jsonl. Only filled for shape-skipped markets.
-        self._skipped_reads: list[dict[str, object]] = []
+        # Every distinct pool each pending market showed while open, for
+        # results_skipped.jsonl, by market id. Only filled for shape-skipped markets.
+        self._skipped_reads: dict[str, list[dict[str, object]]] = {}
         # Off by default so tests and any embedder never reach the network
         # implicitly; main.py turns it on from settings.resolve_map_names.
         self._resolve_maps = resolve_maps
@@ -81,10 +85,14 @@ class MonitoringService:
         self._bankroll_stopped = False
         self._blocked_alerted = False
         self._read_failures = 0
-        self._last_seen_id = self._load_last_seen()
-        # ponytail: one in-memory pending slot (predictions run one at a time on
-        # forg1). Lost on restart -> a result mid-flight won't be reported; fine.
-        self._pending: tuple[Prediction, BetDecision] | None = None
+        # Every market already handled, oldest first. A set of ids, not one
+        # "last id": with two markets open at once, a single id let the bot see
+        # A, then B, then A again as "new" if the order changed, and bet A twice.
+        self._seen_ids: list[str] = self._load_seen()
+        # Markets awaiting their result, by id. forg1 can run several at once
+        # since 2026-10-31. In memory only: lost on restart, so a result
+        # mid-flight won't be reported; fine.
+        self._pending: dict[str, tuple[Prediction, BetDecision]] = {}
         self._last_balance_refresh = time.monotonic()
         self._logout_alerted = False
         self._was_offline: bool | None = None
@@ -112,13 +120,13 @@ class MonitoringService:
             # Cloudflare/Vercel exposure for zero predictions. A bet placed just
             # before the stream ended still needs its result, so a pending slot
             # keeps the loop awake until it resolves.
-            if self._stream_offline() and self._pending is None:
+            if self._stream_offline() and not self._pending:
                 idle_elapsed = 0
                 await self._sleep(self._poll_idle)
                 continue
 
             try:
-                prediction = await self._reader.read_active_prediction()
+                open_predictions = await self._reader.read_open_predictions()
             except CloudflareBlocked as exc:
                 # Not a read error: the bot is locked out and would otherwise
                 # sit here reporting "no predictions" indefinitely.
@@ -132,13 +140,14 @@ class MonitoringService:
                 continue
             await self._clear_blocked_alert()
             await self._clear_read_failures()
-            self._observe_skipped(prediction)
+            for open_prediction in open_predictions:
+                self._observe_skipped(open_prediction)
 
             # A pending prediction may have resolved since the last poll.
             await self._check_pending_resolution()
             await self._maybe_refresh_balance()
 
-            if prediction is None:
+            if not open_predictions:
                 idle_elapsed += self._poll_idle
                 if idle_elapsed >= self._refresh_after_idle:
                     idle_elapsed = 0
@@ -147,7 +156,8 @@ class MonitoringService:
                 continue
 
             idle_elapsed = 0
-            if prediction.id == self._last_seen_id:
+            prediction = next((p for p in open_predictions if p.id not in self._seen_ids), None)
+            if prediction is None:
                 await self._sleep(self._poll_active)
                 continue
 
@@ -171,11 +181,15 @@ class MonitoringService:
 
     # --- dedupe state --------------------------------------------------------
 
-    def _load_last_seen(self) -> str | None:
+    @property
+    def _last_seen_id(self) -> str | None:
+        return self._seen_ids[-1] if self._seen_ids else None
+
+    def _load_seen(self) -> list[str]:
         if not self._seen_path.exists():
-            return None
+            return []
         try:
-            data: dict[str, str] = json.loads(self._seen_path.read_text())
+            data: dict[str, object] = json.loads(self._seen_path.read_text())
         except (json.JSONDecodeError, OSError) as exc:
             # A half-written file (killed mid-write) would otherwise crash the
             # bot at startup, every startup. Losing the id only risks re-betting
@@ -183,13 +197,23 @@ class MonitoringService:
             logger.warning(
                 "Unreadable seen-predictions file ({}); starting fresh.", short_error(exc)
             )
-            return None
-        return data.get("last_id")
+            return []
+        # Files written before 2026-10-31 hold only "last_id".
+        seen = data.get("seen_ids")
+        ids = [str(i) for i in seen] if isinstance(seen, list) else []
+        last = data.get("last_id")
+        if isinstance(last, str) and last not in ids:
+            ids.append(last)
+        return ids[-_SEEN_IDS_KEPT:]
 
     def _save_last_seen(self, prediction_id: str) -> None:
+        if prediction_id not in self._seen_ids:
+            self._seen_ids.append(prediction_id)
+        self._seen_ids = self._seen_ids[-_SEEN_IDS_KEPT:]
         self._seen_path.parent.mkdir(parents=True, exist_ok=True)
-        self._seen_path.write_text(json.dumps({"last_id": prediction_id}))
-        self._last_seen_id = prediction_id
+        self._seen_path.write_text(
+            json.dumps({"last_id": prediction_id, "seen_ids": self._seen_ids})
+        )
 
     # --- betting -------------------------------------------------------------
 
@@ -280,7 +304,14 @@ class MonitoringService:
                     decision.amount,
                     decision.side,
                 )
-                placed = await self._reader.place_bet(decision.side, decision.amount)
+                # Title and outcome count let the reader click the card inside
+                # THIS market when another one is open with the same labels.
+                placed = await self._reader.place_bet(
+                    decision.side,
+                    decision.amount,
+                    market_title=prediction.title,
+                    outcome_count=len(prediction.outcomes),
+                )
             except Exception as exc:
                 logger.error("Bet execution failed: {}", short_error(exc))
         else:
@@ -292,8 +323,8 @@ class MonitoringService:
         remaining = await self._post_bet_balance(placed)
         await self._notify(prediction, decision, placed, remaining)
         # Remember it so the result gets reported once it resolves.
-        self._pending = (prediction, decision)
-        self._skipped_reads = []
+        self._pending[prediction.id] = (prediction, decision)
+        self._skipped_reads[prediction.id] = []
         self._observe_skipped(detected)
         self._observe_skipped(prediction)
 
@@ -311,7 +342,9 @@ class MonitoringService:
         )
         await asyncio.sleep(self._stabilization_seconds)
         try:
-            refreshed = await self._reader.read_active_prediction()
+            # By id: another market may have opened meanwhile, and "the first
+            # open one" would then be a different market.
+            refreshed = await self._reader.read_active_prediction(prediction_id=prediction.id)
         except Exception as exc:
             logger.error(
                 "Failed to re-read stabilized prediction {}: {}", prediction.id, short_error(exc)
@@ -319,7 +352,7 @@ class MonitoringService:
             return None
         if refreshed is None or refreshed.id != prediction.id:
             logger.info(
-                "Prediction {} changed during stabilization; skipping stale snapshot.",
+                "Prediction {} closed during stabilization; skipping stale snapshot.",
                 prediction.id,
             )
             return None
@@ -403,18 +436,17 @@ class MonitoringService:
     def _observe_skipped(self, prediction: Prediction | None) -> None:
         """Remembers this read's pool if it belongs to the pending market and
         that market was skipped for its shape. Observation only."""
-        if self._skipped_log_path is None or prediction is None or self._pending is None:
+        if self._skipped_log_path is None or prediction is None:
             return
-        pending, decision = self._pending
-        if prediction.id != pending.id or not _SHAPE_SKIP_RE.match(decision.reason):
+        entry = self._pending.get(prediction.id)
+        if entry is None or not _SHAPE_SKIP_RE.match(entry[1].reason):
             return
         try:
             points = {o.label: o.total_points for o in prediction.outcomes}
+            reads = self._skipped_reads.setdefault(prediction.id, [])
             # Unchanged pools add nothing; the 5s active poll would repeat them.
-            if not self._skipped_reads or self._skipped_reads[-1]["points"] != points:
-                self._skipped_reads.append(
-                    {"at": prediction.captured_at.isoformat(), "points": points}
-                )
+            if not reads or reads[-1]["points"] != points:
+                reads.append({"at": prediction.captured_at.isoformat(), "points": points})
         except Exception as exc:  # bookkeeping must never break the bot
             logger.warning("Could not record skipped-market read: {}", short_error(exc))
 
@@ -447,7 +479,7 @@ class MonitoringService:
                 "options": [o.label for o in prediction.outcomes],
                 "locks_at": prediction.locks_at.isoformat(),
                 "resolved_at": datetime.now(timezone.utc).isoformat(),
-                "reads": self._skipped_reads,
+                "reads": self._skipped_reads.get(prediction.id, []),
                 "final_points": final,
                 "winner": winner,
                 "reason": decision.reason,
@@ -457,7 +489,7 @@ class MonitoringService:
                 handle.write(json.dumps(record) + "\n")
         except Exception as exc:  # bookkeeping must never break the bot
             logger.warning("Could not append to skipped-markets log: {}", short_error(exc))
-        self._skipped_reads = []
+        self._skipped_reads.pop(prediction.id, None)
 
     async def _post_bet_balance(self, placed: bool) -> int | None:
         """The REAL balance after a bet, or None if unavailable.
@@ -634,20 +666,20 @@ class MonitoringService:
         logger.info("Notification sent for prediction {}", prediction.id)
 
     async def _check_pending_resolution(self) -> None:
-        if self._pending is None:
-            return
-        prediction, decision = self._pending
-        try:
-            winner = await self._reader.read_resolution(prediction.id)
-        except Exception as exc:
-            logger.error("Failed to read resolution for {}: {}", prediction.id, short_error(exc))
-            return
-        if winner is None:
-            return  # not resolved yet
-        self._record_result(prediction, decision, winner)
-        await self._record_skipped(prediction, decision, winner)
-        await self._notify_result(prediction, decision, winner)
-        self._pending = None
+        for prediction_id, (prediction, decision) in list(self._pending.items()):
+            try:
+                winner = await self._reader.read_resolution(prediction_id)
+            except Exception as exc:
+                logger.error(
+                    "Failed to read resolution for {}: {}", prediction_id, short_error(exc)
+                )
+                continue
+            if winner is None:
+                continue  # not resolved yet
+            self._record_result(prediction, decision, winner)
+            await self._record_skipped(prediction, decision, winner)
+            await self._notify_result(prediction, decision, winner)
+            self._pending.pop(prediction_id, None)
 
     async def _notify_result(
         self, prediction: Prediction, decision: BetDecision, winning_label: str

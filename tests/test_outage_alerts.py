@@ -83,11 +83,11 @@ class _FailingReader:
     def __init__(self, failures: int) -> None:
         self.remaining = failures
 
-    async def read_active_prediction(self) -> Any:
+    async def read_open_predictions(self) -> Any:
         if self.remaining > 0:
             self.remaining -= 1
             raise TimeoutError("APIRequestContext.get: Timeout 30000ms exceeded")
-        return None
+        return []
 
 
 def _monitor(tmp_path: Path, reader: Any, notifier: Any) -> MonitoringService:

@@ -45,6 +45,8 @@ class FakeLocator:
         return self
 
     async def wait_for(self, state: str = "visible", timeout: float = 0) -> None:
+        if self._name == "outcome" and self._page.play_gate:
+            raise PlaywrightError("outcome hidden behind the Jugar screen")
         if self._name == "final" and self._page.open_final_after is not None:
             if self._page.attempts > self._page.open_final_after:
                 return
@@ -56,6 +58,11 @@ class FakeLocator:
             raise PlaywrightError(f"{self._name} not visible")
 
     async def click(self, timeout: float = 0, position: Any = None) -> None:
+        if self._name == "gate":
+            self._page.events.append("click:gate")
+            if not self._page.gate_sticks:
+                self._page.play_gate = False
+            return
         # Playwright's click auto-waits for actionability and throws if the
         # element never becomes visible/enabled — the fake mirrors that.
         if (
@@ -80,8 +87,25 @@ class FakeLocator:
             self._page.dialog_open = True  # the confirmation modal opens here
         self._page.events.append(f"click:{self._name}")
 
+    async def evaluate_all(self, expression: str, arg: Any = None) -> list[int]:
+        # Which outcome cards sit inside the market box with the given title.
+        self._page.scope_args = arg
+        return self._page.cards_in_market
+
+    def nth(self, index: int) -> "FakeLocator":
+        return FakeLocator(self._page, f"outcome#{index}")
+
+    async def is_visible(self) -> bool:
+        return self._name != "gate" or self._page.play_gate
+
     async def count(self) -> int:
         if self._name == "no_match":
+            return 0
+        if self._name == "gate":
+            return 1 if self._page.play_gate else 0
+        if self._name == "overlay":
+            return 1 if self._page.dialog_open else 0
+        if self._name == "outcome" and self._page.play_gate:
             return 0
         if self._name in ("turnstile", "turnstile_widget"):
             return 1 if self._page.turnstile_checkbox else 0
@@ -177,6 +201,15 @@ class FakePage:
         self.url = "https://www.forg1.com/predicciones"
         # How many outcome cards contain the side's label ("OT" is inside "OT 2").
         self.outcome_matches = 1
+        # forg1's "Jugar" screen (2026-10-31): while it shows, no outcome card
+        # renders. Clicking it clears it unless gate_sticks says otherwise.
+        self.play_gate = False
+        self.gate_sticks = False
+        self.gate_returns_on_reload = False
+        # Indices of the side's cards that the market-scoping script ties to
+        # the bet's own market; and how many markets the last read saw open.
+        self.cards_in_market: list[int] = []
+        self.scope_args: Any = None
 
     def is_closed(self) -> bool:
         return False
@@ -184,6 +217,8 @@ class FakePage:
     async def reload(self, wait_until: str = "") -> None:
         self.attempts += 1
         self.events.append("reload")
+        if self.gate_returns_on_reload:
+            self.play_gate = True
 
     async def goto(self, url: str, wait_until: str = "") -> None:
         self.url = url
@@ -198,6 +233,8 @@ class FakePage:
         return None
 
     def locator(self, selector: str) -> FakeLocator:
+        if selector == prediction_page._PLAY_GATE_SELECTOR:
+            return FakeLocator(self, "gate")
         if "dialog-overlay" in selector:
             return FakeLocator(self, "overlay")
         if "challenges.cloudflare.com" in selector:
@@ -452,3 +489,141 @@ def test_query_string_is_not_treated_as_drift() -> None:
     asyncio.run(_reader(page)._ensure_live_page())
 
     assert page.events == []
+
+
+# --- forg1's "Jugar" screen (added 2026-10-31) --------------------------------
+
+
+def test_bet_clicks_through_the_jugar_screen_then_bets_once() -> None:
+    # Since 2026-10-31 /predicciones opens on a "Jugar" screen and the outcome
+    # cards only render after it is clicked. place_bet reloads first, so the
+    # screen is back every time and must be cleared before the card is found.
+    page = FakePage()
+    page.play_gate = True
+    page.gate_returns_on_reload = True
+
+    assert asyncio.run(_reader(page).place_bet("TeamA", 350)) is True
+    assert page.events.index("click:gate") < page.events.index("click:outcome")
+    for step in ("click:outcome", "click:primary", "click:final"):
+        assert page.events.count(step) == 1
+
+
+def test_jugar_screen_cooldown_never_blocks_a_bet() -> None:
+    # A poll clicked "Jugar" seconds before the bet; the bet's own reload brings
+    # the screen back. The once-a-minute limit must not leave the bet stuck.
+    page = FakePage()
+    page.play_gate = True
+    page.gate_returns_on_reload = True
+    reader = _reader(page)
+    asyncio.run(reader._ensure_live_page())
+    assert asyncio.run(reader.place_bet("TeamA", 350)) is True
+    assert page.events.count("click:gate") == 2
+
+
+def test_poll_clicks_the_jugar_screen() -> None:
+    page = FakePage()
+    page.play_gate = True
+    asyncio.run(_reader(page)._ensure_live_page())
+    assert page.events == ["click:gate"]
+    assert page.play_gate is False
+
+
+def test_jugar_screen_that_does_not_go_away_is_not_hammered(monkeypatch: Any) -> None:
+    # Polls run every few seconds. If the click does nothing, keep clicking at
+    # most once a minute instead of on every poll.
+    now = [1000.0]
+    monkeypatch.setattr(prediction_page, "_play_gate_clock", lambda: now[0])
+    page = FakePage()
+    page.play_gate = True
+    page.gate_sticks = True
+    reader = _reader(page)
+    for _ in range(5):
+        asyncio.run(reader._ensure_live_page())
+        now[0] += 5
+    assert page.events.count("click:gate") == 1
+    now[0] += 60
+    asyncio.run(reader._ensure_live_page())
+    assert page.events.count("click:gate") == 2
+
+
+def test_jugar_is_never_clicked_while_a_dialog_is_open() -> None:
+    page = FakePage()
+    page.play_gate = True
+    page.dialog_open = True
+    assert asyncio.run(_reader(page)._pass_play_gate(after_reload=True)) is False
+    assert "click:gate" not in page.events
+
+
+def test_no_jugar_screen_means_no_extra_clicks() -> None:
+    page = FakePage()
+    assert asyncio.run(_reader(page)._pass_play_gate()) is False
+    assert page.events == []
+
+
+@pytest.mark.parametrize("text", ["Jugar", "JUGAR", "  jugar ", "¡Jugar!", "Jugar ahora"])
+def test_jugar_text_matches_the_play_button(text: str) -> None:
+    assert prediction_page._PLAY_GATE_TEXT.search(text)
+
+
+@pytest.mark.parametrize(
+    "text", ["Confirmar jugada", "CONFIRMAR JUGADA", "Mis jugadas", "Jugadas", "Jugar 500 pts"]
+)
+def test_jugar_text_never_matches_bet_buttons(text: str) -> None:
+    # "Confirmar jugada" is the bet modal's first confirm; matching it here
+    # would be a click on the money path.
+    assert not prediction_page._PLAY_GATE_TEXT.search(text)
+
+
+# --- several markets open at once (2026-10-31) --------------------------------
+
+
+def _scoped_bet(page: FakePage, open_markets: int) -> bool:
+    reader = _reader(page)
+    reader._open_market_count = open_markets
+    return asyncio.run(
+        reader.place_bet("TeamA", 350, market_title="Quien gana la serie?", outcome_count=2)
+    )
+
+
+def test_card_inside_the_bets_own_market_is_the_one_clicked() -> None:
+    # Two markets share the "TeamA" label; only the card in this market's box
+    # may be clicked, even though two cards match page-wide.
+    page = FakePage()
+    page.outcome_matches = 2
+    page.cards_in_market = [1]
+    assert _scoped_bet(page, open_markets=2) is True
+    assert "click:outcome#1" in page.events
+    assert "click:outcome" not in page.events
+    assert page.scope_args == {
+        "title": "Quien gana la serie?",
+        "count": 2,
+        "card": prediction_page._OUTCOME_SELECTOR,
+    }
+
+
+def test_untied_card_is_refused_while_other_markets_are_open() -> None:
+    # One card matches page-wide, but it could not be tied to this market and
+    # another market is open: it may be THAT market's card. Refuse, no click.
+    page = FakePage()
+    page.cards_in_market = []
+    with pytest.raises(RuntimeError, match="refusing to guess"):
+        _scoped_bet(page, open_markets=2)
+    assert not any(e.startswith(("click:", "fill:")) for e in page.events)
+
+
+def test_two_cards_tied_to_the_market_are_refused() -> None:
+    page = FakePage()
+    page.outcome_matches = 2
+    page.cards_in_market = [0, 1]
+    with pytest.raises(RuntimeError, match="refusing to guess"):
+        _scoped_bet(page, open_markets=2)
+    assert not any(e.startswith(("click:", "fill:")) for e in page.events)
+
+
+def test_single_open_market_keeps_the_old_behaviour() -> None:
+    # Title not found in the page (scoping returns nothing) and only one market
+    # open: the lone matching card is this market's, as before.
+    page = FakePage()
+    page.cards_in_market = []
+    assert _scoped_bet(page, open_markets=1) is True
+    assert page.events.count("click:outcome") == 1

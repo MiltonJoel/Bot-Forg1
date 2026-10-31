@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from loguru import logger
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Frame, Locator, Page
+from pydantic import ValidationError
 
 from app.bot.login import is_logged_out_html
 from app.models.prediction import Outcome, Prediction
@@ -66,8 +67,31 @@ _TURNSTILE_FAILED_MARK = "failure_retry"
 # Cloudflare writes the solved token into this hidden field; while it is empty
 # the site keeps CONFIRMAR disabled. Logging it says whether the widget solved.
 _TURNSTILE_TOKEN_SELECTOR = 'input[name="cf-turnstile-response"], input[type="hidden"]'
+# forg1 added a "Jugar" screen in front of /predicciones on 2026-10-31: the URL
+# stays the same, but the outcome cards only render after it is clicked.
+# Matched as the WHOLE text of a clickable element, so "Confirmar jugada" (the
+# bet modal's first step) and anything else that merely contains the word
+# can never match.
+_PLAY_GATE_SELECTOR = "button, a, [role='button']"
+_PLAY_GATE_TEXT = re.compile(r"^\W*jugar(\s+ahora)?\W*$", re.IGNORECASE)
+# If a click does not make the screen go away, do not hammer it every poll.
+_PLAY_GATE_COOLDOWN_SECONDS = 60.0
+_play_gate_clock = time.monotonic
 # A challenge widget clicked 50 times in 25s is useless and looks like abuse.
 _MAX_TURNSTILE_CLICKS = 3
+# For each matching outcome card, is it inside the market box titled `title`?
+# See PredictionPageReader._card_in_market.
+_CARD_IN_MARKET_JS = """(cards, {title, count, card}) => {
+    const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+    const want = norm(title);
+    const hits = [];
+    cards.forEach((el, i) => {
+        let node = el.parentElement;
+        while (node && !norm(node.textContent).includes(want)) node = node.parentElement;
+        if (node && node.querySelectorAll(card).length === count) hits.push(i);
+    });
+    return hits;
+}"""
 _POST_BET_SUMMARY_JS = """() => /tu jugada\\s+\\d[\\d.]*\\s*pts/i.test(
     document.body.innerText.replace(/\\s+/g, ' ')
 )"""
@@ -190,6 +214,41 @@ def _is_bettable(raw: dict[str, Any], now: datetime) -> bool:
     return True
 
 
+def _build_prediction(raw: dict[str, Any], balance: int, now: datetime) -> Prediction:
+    """Raises pydantic's ValidationError if a field has the wrong type."""
+    return Prediction(
+        id=raw["id"],
+        title=raw["title"],
+        outcomes=[
+            Outcome(
+                id=o["id"],
+                label=o["label"],
+                total_points=o["total_points"],
+                total_bettors=o["total_bettors"],
+            )
+            for o in raw["outcomes"]
+        ],
+        min_bet=raw["min_bet"],
+        max_bet=raw["max_bet"],
+        locks_at=raw["locks_at"],
+        available_points=balance,
+        captured_at=now,
+    )
+
+
+def _describe_validation(exc: ValidationError) -> str:
+    """Field, problem and offending value for each error. The whole point of
+    this log line: short_error() keeps only "1 validation error for
+    Prediction", which says nothing about WHICH field. Market data only, no
+    headers or cookies can be in here."""
+    parts = []
+    for err in exc.errors():
+        where = ".".join(str(p) for p in err.get("loc", ()))
+        value = repr(err.get("input"))[:80]
+        parts.append(f"{where}: {err.get('msg')} (got {value})")
+    return "; ".join(parts)
+
+
 def _path_of(url: str) -> str:
     """Comparable path of a URL: no query, no fragment, no trailing slash."""
     return urlparse(url).path.rstrip("/")
@@ -206,6 +265,69 @@ class PredictionPageReader:
         self._turnstile_clicks = 0
         self._turnstile_reset = False
         self._turnstile_seen = False
+        self._play_gate_clicked_at: float | None = None
+        # Payload objects already reported as unreadable, so a permanent one
+        # warns once instead of every poll.
+        self._unreadable_ids: set[str] = set()
+        # How many markets the last read found open. place_bet only falls back
+        # to an unscoped card match when this is 1.
+        self._open_market_count = 0
+
+    async def _pass_play_gate(self, after_reload: bool = False) -> bool:
+        """Click forg1's "Jugar" screen if it is showing. True if clicked.
+
+        Added 2026-10-31, when forg1 put that screen in front of the markets.
+        Reads never needed it (they are HTTP), but the visible tab does: the
+        balance header and the outcome cards that place_bet clicks live behind
+        it. Nothing here touches a bet: it refuses while any dialog is open
+        and while outcome cards are already on screen, and it clicks at most
+        once a minute so an element that does not go away is not hammered;
+        `after_reload` lifts that limit, because a reload legitimately brings
+        the screen back and a bet must not wait out the minute. Best-effort: any Playwright error is logged and swallowed.
+        """
+        try:
+            gate = self._page.locator(_PLAY_GATE_SELECTOR).filter(has_text=_PLAY_GATE_TEXT)
+            if await gate.count() == 0:
+                return False
+            if await self._page.locator(_DIALOG_OVERLAY_SELECTOR).count() > 0:
+                return False
+            if await self._page.locator(_OUTCOME_SELECTOR).count() > 0:
+                return False
+            if not await gate.first.is_visible():
+                return False
+            now = _play_gate_clock()
+            if (
+                not after_reload
+                and self._play_gate_clicked_at is not None
+                and now - self._play_gate_clicked_at < _PLAY_GATE_COOLDOWN_SECONDS
+            ):
+                return False
+            self._play_gate_clicked_at = now
+            await gate.first.click(timeout=5000)
+            logger.info("Clicked forg1's 'Jugar' screen to reach the predictions.")
+            return True
+        except PlaywrightError as exc:
+            logger.warning("Could not get past the 'Jugar' screen: {}", short_error(exc))
+            return False
+
+    async def _wait_past_play_gate(self, target: Locator, timeout_ms: float) -> bool:
+        """Wait for `target` to show, clicking "Jugar" first if it is in the
+        way. Call right after a reload. If the wait fails, look for the screen
+        once more (it may have rendered late) and wait again only if it was
+        there, so a genuinely missing card costs no extra time."""
+        await self._pass_play_gate(after_reload=True)
+        try:
+            await target.wait_for(state="visible", timeout=timeout_ms)
+            return True
+        except PlaywrightError:
+            pass
+        if not await self._pass_play_gate(after_reload=True):
+            return False
+        try:
+            await target.wait_for(state="visible", timeout=timeout_ms)
+            return True
+        except PlaywrightError:
+            return False
 
     async def _ensure_live_page(self) -> None:
         """Recover from a closed TAB: reopen it in the SAME context, where the
@@ -232,6 +354,7 @@ class PredictionPageReader:
             self._page = await self._page.context.new_page()
             await self._page.goto(self._url, wait_until="domcontentloaded")
             logger.info("Reopened prediction page at {}.", self._url)
+            await self._pass_play_gate(after_reload=True)
             return
         # ponytail: path only. The site appends query strings of its own, and an
         # exact-URL match would renavigate the tab on every single poll.
@@ -240,6 +363,9 @@ class PredictionPageReader:
                 "Prediction tab drifted to {}; navigating back to {}.", self._page.url, self._url
             )
             await self._page.goto(self._url, wait_until="domcontentloaded")
+            await self._pass_play_gate(after_reload=True)
+            return
+        await self._pass_play_gate()
 
     async def _fetch_html(self) -> str:
         """Server-rendered HTML for the predictions page.
@@ -262,44 +388,66 @@ class PredictionPageReader:
             raise CloudflareBlocked(reason)
         return html
 
+    async def read_active_prediction(self, prediction_id: str | None = None) -> Prediction | None:
+        """The first open market, or the open market with `prediction_id`."""
+        predictions = await self.read_open_predictions()
+        if prediction_id is None:
+            return predictions[0] if predictions else None
+        return next((p for p in predictions if p.id == prediction_id), None)
+
     @flaky_page_action
-    async def read_active_prediction(self) -> Prediction | None:
+    async def read_open_predictions(self) -> list[Prediction]:
+        """Every market currently open for bets, in payload order.
+
+        forg1 can run several markets at the same time since 2026-10-31. The
+        monitor used to see only the first one, so a second market open next
+        to it was never bet.
+        """
         html = await self._fetch_html()
         predictions = [p for p in _extract_prediction_objects(html) if _is_valid_prediction(p)]
         now = datetime.now(timezone.utc)
         open_predictions = [p for p in predictions if _is_bettable(p, now)]
-        if not open_predictions:
-            return None
+        # On 2026-10-31 (the day forg1 added the "Jugar" screen) every read
+        # died on "1 validation error for Prediction", stream on or off: one
+        # open object in the payload no longer fits the model, and since it
+        # came first it took the whole read down. Skip what does not fit and
+        # say which field, once.
+        readable = [r for r in open_predictions if self._readable(r, now)]
+        self._open_market_count = len(readable)
+        if not readable:
+            return []
 
-        raw = open_predictions[0]
         balance = await self.read_balance()
-        prediction = Prediction(
-            id=raw["id"],
-            title=raw["title"],
-            outcomes=[
-                Outcome(
-                    id=o["id"],
-                    label=o["label"],
-                    total_points=o["total_points"],
-                    total_bettors=o["total_bettors"],
+        markets = [_build_prediction(raw, balance, now) for raw in readable]
+        for prediction in markets:
+            logger.info(
+                "Prediction read: {} | leading={} ({:.1f}% of {} pool) | balance={}",
+                prediction.title,
+                prediction.leading_outcome.label,
+                prediction.leading_share,
+                prediction.total_pool,
+                balance,
+            )
+        return markets
+
+    def _readable(self, raw: dict[str, Any], now: datetime) -> bool:
+        """True if `raw` builds a Prediction. Otherwise logs why, once per id."""
+        try:
+            _build_prediction(raw, 0, now)
+            return True
+        except ValidationError as exc:
+            key = str(raw.get("id"))
+            if key not in self._unreadable_ids:
+                self._unreadable_ids.add(key)
+                logger.warning(
+                    "Skipping a payload object that is not a readable market: id={} "
+                    "title={!r} status={!r} problems: {}",
+                    key,
+                    raw.get("title"),
+                    raw.get("status"),
+                    _describe_validation(exc),
                 )
-                for o in raw["outcomes"]
-            ],
-            min_bet=raw["min_bet"],
-            max_bet=raw["max_bet"],
-            locks_at=raw["locks_at"],
-            available_points=balance,
-            captured_at=now,
-        )
-        logger.info(
-            "Prediction read: {} | leading={} ({:.1f}% of {} pool) | balance={}",
-            prediction.title,
-            prediction.leading_outcome.label,
-            prediction.leading_share,
-            prediction.total_pool,
-            balance,
-        )
-        return prediction
+            return False
 
     @flaky_page_action
     async def read_resolution(self, prediction_id: str) -> str | None:
@@ -369,6 +517,7 @@ class PredictionPageReader:
         except PlaywrightError:
             logger.warning("Balance button missing; reloading page to recover the header.")
             await self._page.reload(wait_until="domcontentloaded")
+            await self._pass_play_gate(after_reload=True)
             await button.wait_for(state="visible", timeout=15_000)
         try:
             await button.click(timeout=5000)
@@ -379,6 +528,7 @@ class PredictionPageReader:
             # dialog regardless of which one it is.
             logger.warning("Balance button was covered; reloading to clear the overlay.")
             await self._page.reload(wait_until="domcontentloaded")
+            await self._pass_play_gate(after_reload=True)
             await button.wait_for(state="visible", timeout=15_000)
             await button.click(timeout=5000)
         logger.info("Clicked balance refresh button.")
@@ -387,8 +537,15 @@ class PredictionPageReader:
         logger.debug("Refreshing predictions page.")
         await self._ensure_live_page()
         await self._page.reload(wait_until="domcontentloaded")
+        await self._pass_play_gate(after_reload=True)
 
-    async def place_bet(self, side: str, amount: int) -> bool:
+    async def place_bet(
+        self,
+        side: str,
+        amount: int,
+        market_title: str | None = None,
+        outcome_count: int | None = None,
+    ) -> bool:
         """Executes the bet on the live UI: pick the outcome, fill the amount,
         confirm, then clear the Cloudflare-gated final "Confirmar".
 
@@ -401,6 +558,9 @@ class PredictionPageReader:
 
         Returns True only once the post-bet summary renders; False means "we do
         not know whether it landed" and a human should check the site.
+
+        `market_title` and `outcome_count` pick the card inside the right
+        market when several are open at once (see _card_in_market).
         """
         logger.info("place_bet start: side={} amount={}", side, amount)
         await self._ensure_live_page()
@@ -408,7 +568,7 @@ class PredictionPageReader:
         self._turnstile_reset = False
         self._turnstile_seen = False
 
-        await self._select_outcome(side)
+        await self._select_outcome(side, market_title, outcome_count)
         try:
             await self._fill_amount(amount)
         except _AmountNotAccepted as exc:
@@ -423,7 +583,9 @@ class PredictionPageReader:
             return True
         return False
 
-    async def _select_outcome(self, side: str) -> None:
+    async def _select_outcome(
+        self, side: str, market_title: str | None = None, outcome_count: int | None = None
+    ) -> None:
         """Reloads until the outcome card renders, then clicks it.
 
         The monitor reads predictions over HTTP (page.request.get), which renders
@@ -436,31 +598,79 @@ class PredictionPageReader:
         outcome = self._page.locator(_OUTCOME_SELECTOR).filter(has_text=side).first
         for attempt in range(1, 4):
             await self._page.reload(wait_until="domcontentloaded")
-            try:
-                await outcome.wait_for(state="visible", timeout=15_000)
+            # Since 2026-10-31 the cards sit behind a "Jugar" screen. Clicking
+            # it is safe here: nothing has been selected or submitted yet.
+            if await self._wait_past_play_gate(outcome, 15_000):
                 break
-            except PlaywrightError:
-                logger.warning(
-                    "Outcome card for {} not visible (attempt {}/3) — reloading again.",
-                    side,
-                    attempt,
-                )
+            logger.warning(
+                "Outcome card for {} not visible (attempt {}/3) — reloading again.",
+                side,
+                attempt,
+            )
         else:
             raise PlaywrightError(
                 f"Outcome card for {side!r} never became visible after 3 reloads."
             )
 
-        # has_text is a case-insensitive SUBSTRING match, so "OT" also matches the
-        # "OT 2 o +" card. Nothing is submitted yet, so refusing here is free;
-        # clicking .first could stake on the wrong outcome.
-        matches = await self._page.locator(_OUTCOME_SELECTOR).filter(has_text=side).count()
-        if matches > 1:
-            raise _AmbiguousOutcome(
-                f"{matches} outcome cards contain {side!r} — refusing to guess which one"
-            )
+        cards = self._page.locator(_OUTCOME_SELECTOR).filter(has_text=side)
+        target = await self._card_in_market(cards, market_title, outcome_count)
+        if target is None:
+            # has_text is a case-insensitive SUBSTRING match, so "OT" also
+            # matches the "OT 2 o +" card. Nothing is submitted yet, so refusing
+            # here is free; clicking .first could stake on the wrong outcome.
+            matches = await cards.count()
+            if matches > 1:
+                raise _AmbiguousOutcome(
+                    f"{matches} outcome cards contain {side!r} — refusing to guess which one"
+                )
+            # With several markets open, a lone match may belong to ANOTHER
+            # market (this one's cards not rendered yet). Only trust it when
+            # this is the only market open.
+            if market_title is not None and self._open_market_count > 1:
+                raise _AmbiguousOutcome(
+                    f"{self._open_market_count} markets are open and the {side!r} card "
+                    f"could not be tied to {market_title!r} — refusing to guess"
+                )
+            target = outcome
 
         logger.info("Selecting outcome card for {}", side)
-        await outcome.click(timeout=5000)
+        await target.click(timeout=5000)
+
+    async def _card_in_market(
+        self, cards: Locator, market_title: str | None, outcome_count: int | None
+    ) -> Locator | None:
+        """The one card in `cards` that belongs to the market titled
+        `market_title`, or None if that cannot be decided.
+
+        forg1 can show several markets at once since 2026-10-31, and two of them
+        can share labels (the same two teams on "1er MAPA" and "la serie").
+        Without the market's container markup, this works from structure: from
+        each card, climb to the smallest ancestor whose text contains the
+        title. For this market's card that is the market's own box, holding
+        exactly `outcome_count` cards; for another market's card it is a shared
+        ancestor holding both markets' cards, so the count gives it away.
+        Text is compared case-insensitively on textContent (forg1 uppercases
+        with CSS). Anything other than exactly one hit returns None, and the
+        caller then refuses rather than guess.
+        """
+        if not market_title or not outcome_count:
+            return None
+        try:
+            hits: list[int] = await cards.evaluate_all(
+                _CARD_IN_MARKET_JS,
+                {"title": market_title, "count": outcome_count, "card": _OUTCOME_SELECTOR},
+            )
+        except PlaywrightError as exc:
+            logger.warning("Could not tie the card to its market: {}", short_error(exc))
+            return None
+        if len(hits) != 1:
+            logger.info(
+                "{} card(s) tie to market {!r}; falling back to the page-wide check.",
+                len(hits),
+                market_title,
+            )
+            return None
+        return cards.nth(hits[0])
 
     async def _fill_amount(self, amount: int) -> None:
         """Sets the stake and VERIFIES the field actually holds it.

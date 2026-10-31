@@ -73,7 +73,7 @@ def _kills(points: tuple[int, int, int, int], pid: str = "k1") -> Prediction:
 
 
 def _run(m: MonitoringService, decision: BetDecision, reads: list[Prediction]) -> None:
-    m._pending = (reads[0], decision)
+    m._pending = {reads[0].id: (reads[0], decision)}
     for p in reads:
         m._observe_skipped(p)
     m._observe_skipped(_kills((9, 9, 9, 9), pid="other"))  # a different market
@@ -94,7 +94,7 @@ def test_skipped_market_logs_reads_and_final_pool(tmp_path: Path) -> None:
     assert record["final_points"] == final
     assert record["winner"] == "13 a 17"
     assert record["locks_at"] == "2026-10-10T20:40:00+00:00"
-    assert m._pending is None and m._skipped_reads == []
+    assert m._pending == {} and m._skipped_reads == {}
 
 
 def test_priced_market_is_not_logged(tmp_path: Path) -> None:
@@ -114,4 +114,4 @@ def test_logging_failures_never_raise(tmp_path: Path) -> None:
     # Unwritable path (a directory): warning only, the resolution still clears.
     m = _monitor(tmp_path, _FakeReader({}), tmp_path)
     _run(m, _SKIP, [_kills((1, 2, 3, 4))])
-    assert m._pending is None
+    assert m._pending == {}

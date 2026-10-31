@@ -58,10 +58,10 @@ class _BlockedReader:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def read_active_prediction(self) -> Any:
+    async def read_open_predictions(self) -> Any:
         self.calls += 1
         if self.calls > 2:  # recovers on the third poll
-            return None
+            return []
         raise CloudflareBlocked("challenge page (HTTP 403)")
 
 
